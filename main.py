@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 
+import httpx
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -13,6 +14,7 @@ from telegram.ext import (
     PreCheckoutQueryHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -60,6 +62,48 @@ logging.basicConfig(
 nest_asyncio.apply()
 logger = logging.getLogger(__name__)
 
+# httpx 0.28 renamed "proxies" -> "proxy"; keep compatibility with PTB 20.7.
+def _httpx_supports_proxy_kw() -> bool:
+    parts = []
+    for part in httpx.__version__.split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        parts.append(int(num))
+    return tuple(parts[:2]) >= (0, 28)
+
+
+def _normalize_httpx_proxy(proxy):
+    if not isinstance(proxy, dict):
+        return proxy
+    for key in ("all", "all://", "http://", "https://", "http", "https"):
+        value = proxy.get(key)
+        if value:
+            return value
+    for value in proxy.values():
+        if value:
+            return value
+    return None
+
+
+class CompatHTTPXRequest(HTTPXRequest):
+    def _build_client(self) -> httpx.AsyncClient:
+        kwargs = dict(self._client_kwargs)
+        proxy = kwargs.pop("proxies", None)
+        if proxy is not None:
+            if _httpx_supports_proxy_kw():
+                proxy = _normalize_httpx_proxy(proxy)
+                if proxy is not None:
+                    kwargs["proxy"] = proxy
+            else:
+                kwargs["proxies"] = proxy
+        return httpx.AsyncClient(**kwargs)
+
 async def main():
     API_TOKEN = os.getenv("API_TOKEN")
     DATABASE_URL = os.getenv("DATABASE_URL")
@@ -83,7 +127,11 @@ async def main():
     asyncio.create_task(generate_clue())
     asyncio.create_task(update_connect())
     asyncio.create_task(cleanup_single_mode())
-    application = Application.builder().token(API_TOKEN).build()
+    request = CompatHTTPXRequest()
+    builder = Application.builder().token(API_TOKEN).request(request)
+    if hasattr(builder, "get_updates_request"):
+        builder = builder.get_updates_request(CompatHTTPXRequest())
+    application = builder.build()
     handlers = [
         CommandHandler("start", start),
         CommandHandler("create", create_room),
