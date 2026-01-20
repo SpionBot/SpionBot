@@ -2,6 +2,7 @@ import random
 import asyncio
 from dataclasses import dataclass,field
 from datetime import datetime, timezone, timedelta
+from  database.redis import set_room_prob
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional
@@ -17,6 +18,9 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
+
+
+from database.redis import add_user_room,delete_user_room,set_room_prob,_load_room_probs,get_player,update_prob_user
 
 from const import MODE_BRAWL, MODE_CLASH, MODE_DOTA
 from database.actions import db
@@ -415,13 +419,17 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "❌ Не удалось создать комнату. Попробуйте ещё раз."
         )
         return
+    
     success = await db.create_room(room_id, user_id, DEFAULT_MODE)
+
+    #создание вероятностной комнаты
 
     if not success:
         await update.message.reply_text("❌ Ошибка при создании комнаты.")
 
         return
 
+    set_room_prob(user_id, int(room_id))
     words, _ = get_words_and_cards_by_mode(DEFAULT_MODE)
 
     keyboard = get_room_mode_keyboard()
@@ -498,8 +506,8 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Комната переполнена!")
 
             return
-
     players = await db.get_room_players(room_id)
+    add_user_room(int(user_id),int(room_id),len(players))
     inline_keyboard = get_inline_keyboard('join_game')
     keyboard = get_room_keyboard()
     await update.message.reply_text(
@@ -565,13 +573,21 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     mode = room.get("mode", DEFAULT_MODE)
 
+
     words, cards_map = get_words_and_cards_by_mode(mode)
 
     word = random.choice(words)
 
     card_url = cards_map.get(word, "")
 
-    spy = random.choice(players)
+    users_prob = _load_room_probs(int(room_id))
+    if not users_prob:
+        set_room_prob(players, int(room_id), len(players))
+        users_prob = _load_room_probs(int(room_id))
+
+    spy = get_player(users_prob) if users_prob else random.choice(players)
+
+    update_prob_user(spy, int(room_id), len(players))
 
     account = await db.get_user_account(spy)
 
@@ -882,11 +898,13 @@ async def leave_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     room_id = await db.get_user_room(user_id)
 
+
     if not room_id:
         await update.message.reply_text("❌ Вы не в комнате!")
 
         return
 
+    delete_user_room(int(user_id), int(room_id))
     await db.remove_player_from_room(user_id, room_id)
 
     players = await db.get_room_players(room_id)
