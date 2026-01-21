@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal,Tuple
 
 import asyncpg
 
@@ -434,6 +434,43 @@ class ButtonCommand(CreateDB):
                     easy,
                 )
                 return dict(row) if row else None
+    async def update_stat_game(self,user_id : int)->None:
+        async with self.pool.acquire() as conn:
+            await conn.fetchrow(
+                f"""
+                UPDATE user_accounts
+                SET 
+                    games_played = games_played + 1 
+                WHERE 
+                    user_id = $1
+                """,
+                user_id,
+            )
+    async def update_stat_game_vil(self,user_id : int)->None:
+        async with self.pool.acquire() as conn:
+            await conn.fetchrow(
+                f"""
+                UPDATE user_accounts
+                SET
+                    games_played = games_played + 1,
+                    spy_games_played = spy_games_played + 1
+                WHERE 
+                    user_id = $1
+                """,
+                user_id,
+            )
+    async def get_stat_game(self,user_id : int)->Tuple[int,int]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetchrow(
+                f"""
+                SELECT games_played,spy_games_played FROM user_accounts
+                WHERE
+                   user_id = $1
+                """,
+                user_id,
+            )
+            return rows["games_played"],rows["spy_games_played"]
 
 
 db = ButtonCommand(db_init.pool)
+
