@@ -85,4 +85,12 @@ class CreateDB:
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS room_game_stats (
+                    room_id VARCHAR(10) PRIMARY KEY,
+                    games_played INTEGER NOT NULL DEFAULT 0,
+                    spy_games_played INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+                )
+            """)
 db_init = CreateDB()
