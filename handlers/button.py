@@ -146,9 +146,19 @@ def _build_hint_selection_keyboard():
         [InlineKeyboardButton("⬅️ Назад", callback_data="cabinet:account")]
     )
     return InlineKeyboardMarkup(keyboard)
-def _personal_account_text(user, balance, hard, medium, easy):
+def _personal_account_text(
+    user, balance, hard, medium, easy, games_played=None, spy_games_played=None
+):
+    stats_block = ""
+    if games_played is not None and spy_games_played is not None:
+        stats_block = (
+            "\n\n🎮Сыграно игр: "
+            f"{games_played}\n"
+            "🕵️Сыграно за шпиона: "
+            f"{spy_games_played}"
+        )
     name = user.full_name or user.username or "Игрок"
-    return (
+    base_text = (
         "<b>👤 Личный кабинет</b>\n\n"
         f"🔸 Имя: <b>{name}</b>\n\n"
         "📊 Статистика шпиона:\n"
@@ -160,6 +170,7 @@ def _personal_account_text(user, balance, hard, medium, easy):
         "💳 Чтобы пополнить баланс, используйте /donate или меню ниже\n"
         "🛒 Чтобы купить подсказки, воспользуйтесь меню ниже."
 )
+    return base_text + stats_block
 
 
 def _build_donate_keyboard():

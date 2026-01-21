@@ -481,7 +481,7 @@ async def single_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-@subscription_required
+#@subscription_required
 @decorators.rate_limit()
 @decorators.private_chat_only()
 async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -611,7 +611,7 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @decorators.game_not_started()
-@subscription_required
+#@subscription_required
 @decorators.rate_limit()
 @decorators.creator_only()
 @decorators.room_lock()
@@ -667,7 +667,6 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"ℹ️ Кол-во шпионов скорректировано до {spy_count} (игроков: {len(players)})."
         )
         await db.update_room_spy_count(room_id, spy_count)
-
     spies = set(random.sample(players, k=spy_count))
     primary_spy = next(iter(spies))
 
@@ -678,7 +677,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for player_id in players:
         if player_id in spies:
             await db.update_player_role(player_id, room_id, "шпион")
-
+            await db.update_stat_game_vil(player_id)
             account = await db.get_user_account(player_id)
             if not account:
                 easy = medium = hard = 0
@@ -734,7 +733,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         else:
             await db.update_player_role(player_id, room_id, "мирный", word, card_url)
-
+            await db.update_stat_game(player_id)
             if card_url:
                 cached_file_id = await db.get_cached_image(card_url)
 
@@ -1640,8 +1639,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Войти: /join <ID>\n"
                 "Проверить комнату: /room"
             )
-
-
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_chat:
@@ -1827,7 +1824,7 @@ async def personal_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance, hard_count, medium_count, easy_count = await _get_account_summary(
         user_id
     )
-
+    count_game_peac,count_game_vil = await db.get_stat_game(user_id)
     await update.message.reply_text(
         _personal_account_text(
             update.effective_user,
@@ -1835,6 +1832,8 @@ async def personal_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hard_count,
             medium_count,
             easy_count,
+            count_game_peac,
+            count_game_vil
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=_build_cabinet_keyboard(),
@@ -1999,9 +1998,16 @@ async def cabinet_action_callback(
 
     if action == "account":
         balance, hard, medium, easy = await _get_account_summary(query.from_user.id)
+        count_game_peac, count_game_vil = await db.get_stat_game(query.from_user.id)
         await query.message.edit_text(
             _personal_account_text(
-                query.from_user, balance, hard, medium, easy
+                query.from_user,
+                balance,
+                hard,
+                medium,
+                easy,
+                count_game_peac,
+                count_game_vil,
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=_build_cabinet_keyboard(),
