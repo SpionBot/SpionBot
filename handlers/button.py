@@ -174,3 +174,4 @@ def _build_donate_keyboard():
     )
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     return InlineKeyboardMarkup(rows)
+
