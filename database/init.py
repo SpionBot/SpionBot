@@ -67,9 +67,17 @@ class CreateDB:
                     hard_hints INTEGER DEFAULT 0,
                     medium_hints INTEGER DEFAULT 0,
                     easy_hints INTEGER DEFAULT 0,
+                    games_played INTEGER NOT NULL DEFAULT 0,
+                    spy_games_played INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute(
+                "ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS games_played INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute(
+                "ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS spy_games_played INTEGER NOT NULL DEFAULT 0"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS referrals (
                     user_id BIGINT PRIMARY KEY,
@@ -83,14 +91,6 @@ class CreateDB:
                     file_id TEXT NOT NULL,
                     mode VARCHAR(20),
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS room_game_stats (
-                    room_id VARCHAR(10) PRIMARY KEY,
-                    games_played INTEGER NOT NULL DEFAULT 0,
-                    spy_games_played INTEGER NOT NULL DEFAULT 0,
-                    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
                 )
             """)
 db_init = CreateDB()
