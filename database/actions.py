@@ -13,22 +13,29 @@ class ButtonCommand(CreateDB):
         self.pool = pool
 
     async def create_room(
-        self, room_id: str, creator_id: int, mode: str = "clash", spy_count: int = 1
+        self,
+        room_id: str,
+        creator_id: int,
+        mode: str = "clash",
+        spy_count: int = 1,
+        is_public: bool = False,
     ) -> bool:
         if not isinstance(spy_count, int) or spy_count < 1:
             spy_count = 1
+        is_public = bool(is_public)
         async with self.pool.acquire() as conn:
             try:
                 async with conn.transaction():
                     await conn.execute(
                         """
-                        INSERT INTO rooms (id, creator_id, mode, spy_count, expires_at)
-                        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP + INTERVAL '24 hours')
+                        INSERT INTO rooms (id, creator_id, mode, spy_count, is_public, expires_at)
+                        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP + INTERVAL '24 hours')
                         """,
                         room_id,
                         creator_id,
                         mode,
                         spy_count,
+                        is_public,
                     )
                     await conn.execute(
                         """
@@ -114,6 +121,50 @@ class ButtonCommand(CreateDB):
                 spy_count,
                 room_id,
             )
+
+    async def update_room_public(self, room_id: str, is_public: bool) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET is_public = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                bool(is_public),
+                room_id,
+            )
+
+    async def get_public_rooms(self, limit: int = 10) -> List[dict]:
+        if limit < 1:
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    rooms.id,
+                    rooms.mode,
+                    rooms.spy_count,
+                    rooms.creator_id,
+                    rooms.created_at,
+                    COUNT(players.user_id) AS player_count
+                FROM rooms
+                LEFT JOIN players ON rooms.id = players.room_id
+                WHERE rooms.is_public = TRUE
+                  AND rooms.game_started = FALSE
+                  AND rooms.expires_at > NOW()
+                GROUP BY
+                    rooms.id,
+                    rooms.mode,
+                    rooms.spy_count,
+                    rooms.creator_id,
+                    rooms.created_at
+                HAVING COUNT(players.user_id) < 15
+                ORDER BY rooms.created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+            return [dict(row) for row in rows]
 
     async def add_player_to_room(self, user_id: int, room_id: str) -> bool:
         async with self.pool.acquire() as conn:

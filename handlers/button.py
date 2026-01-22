@@ -4,7 +4,7 @@ from const import HINT_TEXT,HINT_LABELS, HINT_PRICES,DONATE_AMOUNTS
 
 def get_main_keyboard(admin : str | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
-            ["🎮 Создать комнату", "🔗 Присоединиться"],
+            ["🎮 Создать комнату", "🔗 Присоединиться","🌐 Открытые комнаты"],
             ["👤 Личный кабинет", "📖 Правила"],
             ["🃏 Сингл мод", "🎁 Реферальная система"],
         ]
@@ -27,12 +27,15 @@ def get_admin_panel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def get_room_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
+def get_room_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    keyboard = [
             ["▶️ Начать игру", "🔄 Перезапустить"],
             ["🚪 Выйти из комнаты", "🏠 Главное меню"],
-        ],
+        ]
+    if is_admin:
+        keyboard.append(["🌐 Открыть комнату", "🔒 Закрыть комнату"])
+    return ReplyKeyboardMarkup(
+        keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
     )

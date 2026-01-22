@@ -10,19 +10,21 @@ from telegram.ext import ContextTypes
 
 from const import (
     MODE_CLASH,
-    HINT_PRICES
+    HINT_PRICES,
+    ADMIN
 )
 from database.actions import db
 from handlers.button import (
     get_game_inline_button,
     get_inline_keyboard,
+    get_room_keyboard,
     get_message_start,
     get_join_room_text,
     get_restart_room_text
 
 )
 from database.redis import get_clue_hero
-from utils.decorators import hint_guard
+from utils.decorators import hint_guard, room_locks
 from utils.gameMod import get_theme_name, get_words_and_cards_by_mode
 
 logger = logging.getLogger(__name__)
@@ -128,6 +130,80 @@ async def back_to_room_callback(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.HTML,
         reply_markup=reply_keyboard,
     )
+
+
+async def public_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    _, room_id = parts
+    if not room_id:
+        return
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id if query.message else user_id
+
+    lock = room_locks.get_lock(room_id)
+    async with lock:
+        room = await db.get_room(room_id)
+        if not room:
+            await context.bot.send_message(chat_id=chat_id, text="Room not found.")
+            return
+        if room.get("game_started"):
+            await context.bot.send_message(chat_id=chat_id, text="Game already started.")
+            return
+        current_room = await db.get_user_room(user_id)
+        if current_room:
+            if current_room == room_id:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="You are already in this room."
+                )
+                return
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="You are already in another room. Leave it first.",
+            )
+            return
+        success = await db.add_player_to_room(user_id, room_id)
+        if not success:
+            await context.bot.send_message(
+                chat_id=chat_id, text="Room is full or unavailable."
+            )
+            return
+
+    players = await db.get_room_players(room_id)
+    inline_keyboard = get_inline_keyboard("join_game")
+    keyboard = get_room_keyboard(user_id in ADMIN)
+    spy_count = room.get("spy_count", 1)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ Вы присоединились к комнате {room_id}!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=get_join_room_text(
+            room_id, len(players), get_theme_name(DEFAULT_MODE), spy_count=spy_count
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=inline_keyboard,
+    )
+
+    creator_id = room.get("creator_id")
+    if creator_id:
+        try:
+            await context.bot.send_message(
+                creator_id,
+                f"📢 Игрок присоединился! Теперь игроков: {len(players)}",
+            )
+        except Exception:
+            pass
 
 
 @hint_guard

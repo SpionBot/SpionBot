@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 
+import httpx
+
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -15,9 +17,10 @@ from telegram.ext import (
 )
 
 load_dotenv()
-
+from telegram.request import HTTPXRequest
 from database.actions import db
 from handlers.commands import (
+    admin_broadcast_confirm_callback,
     admin_panel,
     buy_hint,
     buy_hint_cancel_callback,
@@ -33,6 +36,8 @@ from handlers.commands import (
     handle_text_message,
     join_room,
     leave_room,
+    make_room_private,
+    make_room_public,
     personal_account,
     precheckout_callback,
     restart_game,
@@ -56,6 +61,7 @@ from handlers.callback import (
     show_clues_callback,
     back_to_room_callback,
     set_spies_callback,
+    public_join_callback,
 )
 from utils.background import generate_clue, periodic_cleanup,update_connect,cleanup_single_mode
 logging.basicConfig(
@@ -64,11 +70,51 @@ logging.basicConfig(
 nest_asyncio.apply()
 logger = logging.getLogger(__name__)
 
+def _httpx_supports_proxy_kw() -> bool:
+    parts = []
+    for part in httpx.__version__.split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        parts.append(int(num))
+    return tuple(parts[:2]) >= (0, 28)
+
+
+def _normalize_httpx_proxy(proxy):
+    if not isinstance(proxy, dict):
+        return proxy
+    for key in ("all", "all://", "http://", "https://", "http", "https"):
+        value = proxy.get(key)
+        if value:
+            return value
+    for value in proxy.values():
+        if value:
+            return value
+    return None
+
+
+class CompatHTTPXRequest(HTTPXRequest):
+    def _build_client(self) -> httpx.AsyncClient:
+        kwargs = dict(self._client_kwargs)
+        proxy = kwargs.pop("proxies", None)
+        if proxy is not None:
+            if _httpx_supports_proxy_kw():
+                proxy = _normalize_httpx_proxy(proxy)
+                if proxy is not None:
+                    kwargs["proxy"] = proxy
+            else:
+                kwargs["proxies"] = proxy
+        return httpx.AsyncClient(**kwargs)
 async def main():
     API_TOKEN = os.getenv("API_TOKEN")
     DATABASE_URL = os.getenv("DATABASE_URL")
 
-    if not API_TOKEN or API_TOKEN == "ВАШ_API_КЛЮЧ":
+    if not API_TOKEN:
         print("❌ Установите API_TOKEN в .env файле!")
         return
 
@@ -87,11 +133,17 @@ async def main():
     asyncio.create_task(generate_clue())
     asyncio.create_task(update_connect())
     asyncio.create_task(cleanup_single_mode())
-    application = Application.builder().token(API_TOKEN).build()
+    request = CompatHTTPXRequest()
+    builder = Application.builder().token(API_TOKEN).request(request)
+    if hasattr(builder, "get_updates_request"):
+        builder = builder.get_updates_request(CompatHTTPXRequest())
+    application = builder.build()
     handlers = [
         CommandHandler("start", start),
         CommandHandler("create", create_room),
         CommandHandler("join", join_room),
+        CommandHandler("public", make_room_public),
+        CommandHandler("private", make_room_private),
         CommandHandler("startgame", start_game),
         CommandHandler("restart", restart_game),
         CommandHandler("admin", admin_panel),
@@ -133,6 +185,11 @@ async def main():
         CallbackQueryHandler(donate_amount_callback, pattern=r"^donate_amount:")
     )
     application.add_handler(
+        CallbackQueryHandler(
+            admin_broadcast_confirm_callback, pattern=r"^admin_broadcast:"
+        )
+    )
+    application.add_handler(
         CallbackQueryHandler(check_clue_callback, pattern=r"^check_clue:")
     )
     application.add_handler(
@@ -143,6 +200,9 @@ async def main():
     )
     application.add_handler(
         CallbackQueryHandler(set_spies_callback, pattern=r"^spies:set:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(public_join_callback, pattern=r"^public_join:")
     )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))

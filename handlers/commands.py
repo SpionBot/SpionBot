@@ -486,6 +486,11 @@ async def single_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @decorators.private_chat_only()
 async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    is_public = False
+    if context.args:
+        flag = context.args[0].strip().lower()
+        if flag in {"open", "public", "true", "1"}:
+            is_public = True
     for _ in range(10):
         room_id = str(random.randint(1000, 9999))
         room = await db.get_room(room_id)
@@ -496,7 +501,9 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "❌ Не удалось создать комнату. Попробуйте ещё раз."
         )
         return
-    success = await db.create_room(room_id, user_id, DEFAULT_MODE, spy_count=1)
+    success = await db.create_room(
+        room_id, user_id, DEFAULT_MODE, spy_count=1, is_public=is_public
+    )
 
     if not success:
         await update.message.reply_text("❌ Ошибка при создании комнаты.")
@@ -523,11 +530,57 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _show_public_rooms(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    limit: int = 10,
+) -> None:
+    chat_id = (
+        update.effective_chat.id if update.effective_chat else update.effective_user.id
+    )
+    rooms = await db.get_public_rooms(limit=limit)
+    if not rooms:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Открытых комнат пока нет. Можно зайти по ID: /join <ID>.",
+        )
+        return
+
+    lines = ["Открытые комнаты (нажмите, чтобы зайти):"]
+    keyboard_rows = []
+    for room in rooms:
+        room_id = room["id"]
+        player_count = room.get("player_count", 0) or 0
+        mode = room.get("mode") or DEFAULT_MODE
+        lines.append(f"- {room_id} | {player_count}/15 | {mode}")
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{room_id} ({player_count}/15)",
+                    callback_data=f"public_join:{room_id}",
+                )
+            ]
+        )
+    lines.append("Чтобы зайти в закрытую комнату: /join <ID>.")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
 @subscription_required
 @decorators.rate_limit()
 @decorators.private_chat_only()
 async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if (
+        len(context.args) == 0
+        and (not update.message or not update.message.text or not update.message.text.isdigit())
+    ):
+        await _show_public_rooms(update, context)
+        return
 
     if update.message.text == "🔗 Присоединиться":
         await update.message.reply_text("📝 Введите ID комнаты для присоединения:")
@@ -586,7 +639,7 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     players = await db.get_room_players(room_id)
     inline_keyboard = get_inline_keyboard('join_game')
-    keyboard = get_room_keyboard()
+    keyboard = get_room_keyboard(user_id in ADMIN)
     spy_count = room.get("spy_count", 1)
     await update.message.reply_text(
         text = f"✅ Вы присоединились к комнате {room_id}!\n\n",
@@ -608,6 +661,52 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except:
         pass
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_public(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("No active room.")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("Комната не найдена")
+        return
+    if room.get("is_public"):
+        await update.message.reply_text("Комната уже открытая")
+        return
+    await db.update_room_public(room_id, True)
+    await update.message.reply_text(
+        "Комната теперь общедоступна. Она появится в списке рассылки /join."
+    )
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("No active room.")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("Комната не найдена")
+        return
+    if not room.get("is_public"):
+        await update.message.reply_text("Комната не видна игрокам")
+        return
+    await db.update_room_public(room_id, False)
+    await update.message.reply_text(
+        "Комната теперь приватная. Она не будет отображаться в списке /join."
+    )
 
 
 @decorators.game_not_started()
@@ -1147,7 +1246,7 @@ async def show_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mode = room.get("mode", DEFAULT_MODE) if room else DEFAULT_MODE
 
-        keyboard = get_room_keyboard()
+        keyboard = get_room_keyboard(user_id in ADMIN)
 
     else:
         mode = DEFAULT_MODE
@@ -1228,7 +1327,7 @@ async def _announce_mode_change(update: Update, mode: str):
             "▶️ Начать игру и 🔄 Перезапустить уже доступны ниже."
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=get_room_keyboard(),
+        reply_markup=get_room_keyboard(update.effective_user.id in ADMIN),
     )
 
 
@@ -1240,7 +1339,7 @@ async def _update_room_mode(update: Update, mode: str):
     if room["mode"] == mode:
         await update.message.reply_text(
             f"ℹ️ Режим уже {get_theme_name(mode)}.",
-            reply_markup=get_room_keyboard(),
+            reply_markup=get_room_keyboard(update.effective_user.id in ADMIN),
         )
         return
 
@@ -1356,13 +1455,39 @@ async def admin_global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _build_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Запустить", callback_data="admin_broadcast:confirm"
+                ),
+                InlineKeyboardButton("❌ Отмена", callback_data="admin_broadcast:cancel"),
+            ]
+        ]
+    )
+
+
+async def admin_broadcast_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN:
         await update.message.reply_text("❌ Нет доступа.")
         return
+    message = update.effective_message
+    if not message:
+        return
+    await message.reply_text(
+        "⚠️ Подтвердите запуск рассылки.\nСообщение получат все пользователи.",
+        reply_markup=_build_broadcast_confirm_keyboard(),
+    )
 
-    status_msg = await update.message.reply_text("⏳ Запускаю рассылку...")
+
+async def _run_broadcast(context: ContextTypes.DEFAULT_TYPE, status_msg):
+    if status_msg:
+        try:
+            await status_msg.edit_text("⏳ Запускаю рассылку...")
+        except Exception:
+            status_msg = None
     user_ids = await db.get_all_known_user_ids()
 
     text = (
@@ -1395,9 +1520,49 @@ async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAUL
         if idx % 25 == 0:
             await asyncio.sleep(0.2)
 
-    await status_msg.edit_text(
-        f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
-    )
+    if status_msg:
+        try:
+            await status_msg.edit_text(
+                f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
+            )
+        except Exception:
+            pass
+
+
+async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+    status_msg = await message.reply_text("⏳ Запускаю рассылку...")
+    await _run_broadcast(context, status_msg)
+
+
+async def admin_broadcast_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if not query:
+        return
+    user_id = query.from_user.id
+    if user_id not in ADMIN:
+        await query.answer("❌ Нет доступа.", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":", 1)[-1]
+    if action == "cancel":
+        try:
+            await query.message.edit_text("❌ Рассылка отменена.")
+        except Exception:
+            pass
+        return
+    if action != "confirm":
+        return
+    await _run_broadcast(context, query.message)
 
 
 async def single_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1574,6 +1739,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await create_room(update, context)
     elif text == "🔗 Присоединиться":
         await join_room(update, context)
+    elif text == "🌐 Открытые комнаты":
+        await _show_public_rooms(update, context)
     elif text in MODE_SELECTION_LABELS:
         await _update_room_mode(update, MODE_SELECTION_LABELS[text])
     elif text == "▶️ Начать игру":
@@ -1592,6 +1759,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_players(update, context)
     elif text == "🚪 Выйти из комнаты":
         await leave_room(update, context)
+    elif text == "🌐 Открыть комнату":
+        await make_room_public(update, context)
+    elif text == "🔒 Закрыть комнату":
+        await make_room_private(update, context)
     elif text == "👤 Личный кабинет":
         await personal_account(update, context)
     elif text == "🎁 Реферальная система":
@@ -1611,7 +1782,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "📈 Общая стата":
         await admin_global_stats(update, context)
     elif text == "📢 Запустить рассылку":
-        await admin_broadcast_subscribe(update, context)
+        await admin_broadcast_prompt(update, context)
     elif text == "⬅️ Назад":
         user_id = update.effective_user.id
         if user_id in ADMIN:
