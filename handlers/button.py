@@ -4,9 +4,9 @@ from const import HINT_TEXT,HINT_LABELS, HINT_PRICES,DONATE_AMOUNTS
 
 def get_main_keyboard(admin : str | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
-            ["🎮 Создать комнату", "🔗 Присоединиться","🌐 Открытые комнаты"],
+            ["🎮 Создать комнату", "🔗 Присоединиться"],
             ["👤 Личный кабинет", "📖 Правила"],
-            ["🃏 Сингл мод", "🎁 Реферальная система"],
+            ["🃏 Сингл мод","🌐 Открытые комнаты"],
         ]
     if admin is not None:
         keyboard.append([admin])
@@ -130,7 +130,8 @@ def _build_cabinet_keyboard():
             [
                 InlineKeyboardButton(
                     "💳 Пополнить баланс", callback_data="cabinet:donate"
-                )
+                ),
+                InlineKeyboardButton("🎁 Реферальная система",callback_data="cabinet:referal")
             ],
         ]
     )

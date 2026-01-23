@@ -694,7 +694,7 @@ async def make_room_private(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = update.effective_user.id
     room_id = await db.get_user_room(user_id)
     if not room_id:
-        await update.message.reply_text("No active room.")
+        await update.message.reply_text("Комнаты не существуе")
         return
     room = await db.get_room(room_id)
     if not room:
@@ -1765,8 +1765,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await make_room_private(update, context)
     elif text == "👤 Личный кабинет":
         await personal_account(update, context)
-    elif text == "🎁 Реферальная система":
-        await referral_system(update, context)
+    #elif text == "🎁 Реферальная система":
+    #    await referral_system(update, context)
     elif text == "ℹ️ Помощь" or text == "🏠 Главное меню":
         user_id = update.effective_user.id
         room_id = await db.get_user_room(user_id)
@@ -1953,6 +1953,7 @@ async def referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referral_link = (
         f"https://t.me/{bot_username}?start={referral_code}" if bot_username else None
     )
+    print('referral_link:',referral_link)
     total_referrals = await db.get_referral_count(user_id)
     earned_stars = total_referrals * 2
     lines = [
@@ -1980,7 +1981,10 @@ async def referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append(
         [InlineKeyboardButton("🏠 Главное меню", callback_data="cabinet:menu")]
     )
-    await update.message.reply_text(
+    message = update.effective_message
+    if not message:
+        return
+    await message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2161,13 +2165,13 @@ async def cabinet_action_callback(
         )
         return
 
-    if action == "donate":
+    elif action == "donate":
         await query.message.edit_text(
             "💳 Выберите, сколько звезд хотите пополнить:", reply_markup=_build_donate_keyboard()
         )
         return
 
-    if action == "account":
+    elif action == "account":
         balance, hard, medium, easy = await _get_account_summary(query.from_user.id)
         count_game_peac, count_game_vil = await db.get_stat_game(query.from_user.id)
         await query.message.edit_text(
@@ -2183,7 +2187,8 @@ async def cabinet_action_callback(
             parse_mode=ParseMode.HTML,
             reply_markup=_build_cabinet_keyboard(),
         )
-
+    elif action == "referal":
+        await referral_system(update, context)
 
 async def donate_amount_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
