@@ -20,6 +20,7 @@ load_dotenv()
 
 from database.actions import db
 from handlers.commands import (
+    admin_panel,
     buy_hint,
     buy_hint_cancel_callback,
     buy_hint_confirm_callback,
@@ -37,6 +38,7 @@ from handlers.commands import (
     personal_account,
     precheckout_callback,
     restart_game,
+    room_status,
     rules,
     set_mode_brawl,
     set_mode_clash,
@@ -46,6 +48,7 @@ from handlers.commands import (
     show_stats,
     start,
     start_game,
+    set_spies,
     successful_payment_callback,
     single_mode,
     single_mode_callback,
@@ -54,6 +57,7 @@ from handlers.callback import (
     check_clue_callback,
     show_clues_callback,
     back_to_room_callback,
+    set_spies_callback,
 )
 from utils.background import generate_clue, periodic_cleanup,update_connect,cleanup_single_mode
 logging.basicConfig(
@@ -138,6 +142,7 @@ async def main():
         CommandHandler("join", join_room),
         CommandHandler("startgame", start_game),
         CommandHandler("restart", restart_game),
+        CommandHandler("admin", admin_panel),
         CommandHandler("word", get_word),
         CommandHandler("players", show_players),
         CommandHandler("leave", leave_room),
@@ -151,6 +156,8 @@ async def main():
         CommandHandler("stats", show_stats),
         CommandHandler("account", personal_account),
         CommandHandler("buy_hint", buy_hint),
+        CommandHandler("spies", set_spies),
+        CommandHandler("room", room_status),
     ]
     application.add_handler(
         CallbackQueryHandler(check_subscription_callback, pattern="check_subscription")
@@ -181,6 +188,9 @@ async def main():
     )
     application.add_handler(
         CallbackQueryHandler(back_to_room_callback, pattern="back_to_room")
+    )
+    application.add_handler(
+        CallbackQueryHandler(set_spies_callback, pattern=r"^spies:set:")
     )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
