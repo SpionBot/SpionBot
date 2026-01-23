@@ -505,6 +505,7 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         room_id, user_id, DEFAULT_MODE, spy_count=1, is_public=is_public
     )
 
+
     if not success:
         await update.message.reply_text("❌ Ошибка при создании комнаты.")
 
@@ -528,7 +529,6 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🕵️ Выберите количество шпионов для комнаты:",
         reply_markup=build_spy_count_keyboard(room_id),
     )
-
 
 async def _show_public_rooms(
     update: Update,
@@ -568,6 +568,7 @@ async def _show_public_rooms(
         text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
+
 
 
 @subscription_required
@@ -777,6 +778,15 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if player_id in spies:
             await db.update_player_role(player_id, room_id, "шпион")
             await db.update_stat_game_vil(player_id)
+            account = await db.get_user_account(player_id)
+            if not account:
+                easy = medium = hard = 0
+            else:
+                easy = account["easy_hints"]
+                medium = account["medium_hints"]
+                hard = account["hard_hints"]
+            keyboard_inline = get_game_inline_button(easy, medium, hard)
+
             account = await db.get_user_account(player_id)
             if not account:
                 easy = medium = hard = 0
@@ -1810,6 +1820,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Войти: /join <ID>\n"
                 "Проверить комнату: /room"
             )
+            
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_chat:

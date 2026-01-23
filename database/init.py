@@ -48,9 +48,11 @@ class CreateDB:
             await conn.execute(
                 "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS spy_count INTEGER NOT NULL DEFAULT 1"
             )
+
             await conn.execute(
                 "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
             )
+
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS players (
