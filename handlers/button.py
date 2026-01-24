@@ -6,7 +6,7 @@ def get_main_keyboard(admin : str | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
             ["🎮 Создать комнату", "🔗 Присоединиться"],
             ["👤 Личный кабинет", "📖 Правила"],
-            ["🃏 Сингл мод","🌐 Открытые комнаты"],
+            ["🃏 Сингл мод"],
         ]
     if admin is not None:
         keyboard.append([admin])
@@ -27,19 +27,21 @@ def get_admin_panel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def get_room_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def get_room_keyboard(admin : bool = False,is_public: bool = False) -> ReplyKeyboardMarkup:
+    toggle_label = (
+        "🔒 Закрыть комнату" if is_public else "🌐 Открыть комнату"
+    )
     keyboard = [
             ["▶️ Начать игру", "🔄 Перезапустить"],
             ["🚪 Выйти из комнаты", "🏠 Главное меню"],
-        ]
-    if is_admin:
-        keyboard.append(["🌐 Открыть комнату", "🔒 Закрыть комнату"])
+    ]
+    if admin:
+        keyboard.append([toggle_label])
     return ReplyKeyboardMarkup(
         keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
-
 def get_game_inline_button(easy: int, medium: int, hard: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -71,12 +73,16 @@ def get_room_mode_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
-def get_message_start(room_id: str, players: int, mode: str, spy_count: int = 1) -> str:
+def get_message_start(status : bool,room_id: str, players: int, mode: str, spy_count: int = 1) -> str:
+    status_room = (
+        "🔒 Закрытая комната" if not status else "🌐 Открытая комната"
+    )
     return (
         f"ID комнаты: <code>{room_id}</code>\n"
         f"Отправьте этот ID другим игрокам\n\n"
         f"👥 Игроков: {str(players)}/15\n"
         f"🎴 Режим: {mode}\n"
+        f"ℹ️ Статус комнаты:{status_room}\n"
         f"🕵️ Шпионов: {spy_count}\n"
         f"🕵️ Сменить: /spies &lt;число&gt;\n"
         f"⬇️ Выберите режим через кнопки снизу\n"
@@ -84,21 +90,29 @@ def get_message_start(room_id: str, players: int, mode: str, spy_count: int = 1)
         f"📲 /mode_clash, /mode_dota или /mode_brawl \n"
         f"🔥 Тыкни на подсказки и узнай как побеждать проще 🙂"
     )
-def get_restart_room_text(room_id,players,room) -> str:
+def get_restart_room_text(status : bool,room_id,players,room) -> str:
+    status_room = (
+        "🔒 Закрытая комната" if not status else "🌐 Открытая комната"
+    )
     return (
     f"🔄 Игра перезапущена!\n\n"
     f"ID комнаты: <code>{room_id}</code>\n"
     f"👥 Игроков: {len(players)}\n"
     f"🎴 Режим: {get_theme_name(room['mode'])}\n"
+    f"ℹ️ Статус комнаты:{status_room}\n"
     f"🕵️ Шпионов: {room.get('spy_count', 1)}\n"
     f"🕵️ Сменить: /spies &lt;число&gt;\n"
     f"🎱 Используй для смены режимы \n /mode_clash /mode_dota /mode_brawl \n"
     f"Для начала новой игры нажмите '▶️ Начать игру'")
 
-def get_join_room_text(room_id,players,mode, spy_count: int = 1) -> str:
+def get_join_room_text(status : bool,room_id,players,mode, spy_count: int = 1) -> str:
+    status_room = (
+        "🔒 Закрытая комната" if not status else "🌐 Открытая комната"
+    )
     return (
         f"ID комнаты: <code>{room_id}</code>\n"
         f"Отправьте этот ID другим игрокам\n\n"
+        f"ℹ️ Статус комнаты:{status_room}\n"
         f"👥 Игроков: {str(players)}/15\n"
         f"🎴 Режим: {mode}\n"
         f"🕵️ Шпионов: {spy_count}\n"
@@ -153,19 +167,18 @@ def _build_hint_selection_keyboard():
 def _personal_account_text(
     user, balance, hard, medium, easy, games_played=None, spy_games_played=None
 ):
-    stats_block = ""
-    if games_played is not None and spy_games_played is not None:
-        stats_block = (
-            "\n\n🎮Сыграно игр: "
-            f"{games_played}\n"
-            "🕵️Сыграно за шпиона: "
-            f"{spy_games_played}"
-        )
+    games_played = games_played or 0
+    spy_games_played = spy_games_played or 0
+
+    stats_block = (
+        f"\n\n🎮Сыграно игр: {games_played}\n"
+        f"🕵️Сыграно за шпиона: {spy_games_played}"
+    )
+
     name = user.full_name or user.username or "Игрок"
     base_text = (
         "<b>👤 Личный кабинет</b>\n\n"
         f"🔸 Имя: <b>{name}</b>\n\n"
-        "📊 Статистика шпиона:\n"
         f"⭐ Баланс: <b>{balance}</b> ⭐\n\n"
         "📦 На счету подсказок:\n"
         f"• {HINT_LABELS['hard']}: {hard} шт.\n"

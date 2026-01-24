@@ -134,10 +134,13 @@ async def main():
     asyncio.create_task(generate_clue())
     asyncio.create_task(update_connect())
     asyncio.create_task(cleanup_single_mode())
-    request = CompatHTTPXRequest()
+    # Separate pools: long polling occupies one connection, so allocate more for bot API calls.
+    request = CompatHTTPXRequest(connection_pool_size=20, pool_timeout=20)
     builder = Application.builder().token(API_TOKEN).request(request)
     if hasattr(builder, "get_updates_request"):
-        builder = builder.get_updates_request(CompatHTTPXRequest())
+        builder = builder.get_updates_request(
+            CompatHTTPXRequest(connection_pool_size=1, pool_timeout=20)
+        )
     application = builder.build()
     handlers = [
         CommandHandler("start", start),

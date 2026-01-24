@@ -152,33 +152,41 @@ async def public_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     async with lock:
         room = await db.get_room(room_id)
         if not room:
-            await context.bot.send_message(chat_id=chat_id, text="Room not found.")
+            await context.bot.send_message(chat_id=chat_id, text="❗Комната не найдена.")
             return
         if room.get("game_started"):
-            await context.bot.send_message(chat_id=chat_id, text="Game already started.")
+            await context.bot.send_message(chat_id=chat_id, text="❗Игра уже началась.")
             return
         current_room = await db.get_user_room(user_id)
         if current_room:
             if current_room == room_id:
                 await context.bot.send_message(
-                    chat_id=chat_id, text="You are already in this room."
+                    chat_id=chat_id, text="❗Вы уже в этой комнате."
                 )
                 return
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="You are already in another room. Leave it first.",
+                text="❗Вы уже в другой комнате. Сначала выйдите из неё.",
             )
             return
         success = await db.add_player_to_room(user_id, room_id)
         if not success:
             await context.bot.send_message(
-                chat_id=chat_id, text="Room is full or unavailable."
+                chat_id=chat_id, text="❗Комната заполнена или недоступна."
             )
             return
+    if query.message:
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
 
     players = await db.get_room_players(room_id)
     inline_keyboard = get_inline_keyboard("join_game")
-    keyboard = get_room_keyboard(user_id in ADMIN)
+    keyboard = get_room_keyboard(is_public=room.get("is_public", False))
     spy_count = room.get("spy_count", 1)
     await context.bot.send_message(
         chat_id=chat_id,
@@ -189,7 +197,7 @@ async def public_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_message(
         chat_id=chat_id,
         text=get_join_room_text(
-            room_id, len(players), get_theme_name(DEFAULT_MODE), spy_count=spy_count
+             room['is_public'],room_id, len(players), get_theme_name(DEFAULT_MODE), spy_count=spy_count
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=inline_keyboard,
@@ -241,7 +249,7 @@ async def check_clue_callback(
     if count_hints[clue_type] <= 0:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="У вас нет подсказок,для данного типа.Приобрести подсказку можно в личном кабинете",
+            text="❌ У вас нет подсказок,для данного типа.Приобрести подсказку можно в личном кабинете",
         )
         logger.info(f"У пользователя нет подсказок типа {clue_type}")
         return
