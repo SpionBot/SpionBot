@@ -1595,9 +1595,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await leave_room(update, context)
     elif text == "👤 Личный кабинет":
         await personal_account(update, context)
-    elif text == "🎁 Реферальная система":
-        await referral_system(update, context)
-    elif text == "ℹ️ Помощь" or text == "🏠 Главное меню":
+    elif text == "❓Поддержка":
+        await help_system(update, context)
+    elif text == "🏠 Главное меню":
         user_id = update.effective_user.id
         room_id = await db.get_user_room(user_id)
 
@@ -2041,4 +2041,16 @@ async def donate_amount_callback(
     await query.message.edit_text(
         f"🧾 Формирую счёт на {amount} ⭐. Проверьте чат.",
         reply_markup=_build_cabinet_keyboard(),
+    )
+async def help_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await context.bot.send_message(
+                chat_id=user_id,
+                текст = (
+                    "Кнопка поддержки позволяет отправить сообщение для общения с командой 💬\n"
+                    "Все обращения обрабатываются администраторами 👩‍💻\n"
+                    "Вы также можете прикреплять фотографии 📸\n\n"
+                    "Кроме того, сюда можно отправлять ваши идеи по улучшению бота 💡\n"
+                    "Лучшие предложения будут использованы,создатель получит награду!💰✨"
+                )
     )

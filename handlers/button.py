@@ -6,7 +6,7 @@ def get_main_keyboard(admin : str | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
             ["🎮 Создать комнату", "🔗 Присоединиться"],
             ["👤 Личный кабинет", "📖 Правила"],
-            ["🃏 Сингл мод", "🎁 Реферальная система"],
+            ["🃏 Сингл мод", "❓Поддержка"],
         ]
     if admin is not None:
         keyboard.append([admin])
