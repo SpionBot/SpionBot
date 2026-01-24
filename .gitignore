@@ -4,3 +4,8 @@
 /.ruff_cache
 /.pycache
 __pycache__
+.idea
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__

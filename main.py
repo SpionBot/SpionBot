@@ -15,6 +15,7 @@ from telegram.ext import (
     PreCheckoutQueryHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 from telegram.request import HTTPXRequest
@@ -111,6 +112,7 @@ class CompatHTTPXRequest(HTTPXRequest):
             else:
                 kwargs["proxies"] = proxy
         return httpx.AsyncClient(**kwargs)
+
 async def main():
     API_TOKEN = os.getenv("API_TOKEN")
     DATABASE_URL = os.getenv("DATABASE_URL")
