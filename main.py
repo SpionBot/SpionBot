@@ -33,6 +33,7 @@ from handlers.commands import (
     error_handler,
     get_word,
     handle_text_message,
+    handle_voice_message,
     join_room,
     leave_room,
     personal_account,
@@ -199,6 +200,7 @@ async def main():
     )
     for handler in handlers:
         application.add_handler(handler)
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
