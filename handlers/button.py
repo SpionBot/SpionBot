@@ -20,7 +20,8 @@ def get_admin_panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📊 Стата сингл мода","📈 Общая стата"],
-            ["📢 Запустить рассылку","⬅️ Назад"], 
+            ["📢 Запустить рассылку","👤 Жалобы"], 
+            ["⬅️ Назад"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -174,3 +175,42 @@ def _build_donate_keyboard():
     )
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     return InlineKeyboardMarkup(rows)
+
+def get_keyboard_report() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["⬅️ Назад"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+def get_report_inline_keyboard(
+    index: int, total: int, report_user_id: int
+) -> InlineKeyboardMarkup:
+    if total > 1:
+        prev_index = (index - 1) % total
+        next_index = (index + 1) % total
+        nav_row = [
+            InlineKeyboardButton("⬅️", callback_data=f"report:nav:{prev_index}"),
+            InlineKeyboardButton(f"{index + 1}/{total}", callback_data="report:noop"),
+            InlineKeyboardButton("➡️", callback_data=f"report:nav:{next_index}"),
+        ]
+    else:
+        nav_row = [InlineKeyboardButton("1/1", callback_data="report:noop")]
+
+    return InlineKeyboardMarkup(
+        [
+            nav_row,
+            [
+                InlineKeyboardButton(
+                    "🗑️ Удалить", callback_data=f"report:delete:{report_user_id}:{index}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✉️ Написать", callback_data=f"report:reply:{report_user_id}:{index}"
+                )
+            ],
+        ]
+    )
