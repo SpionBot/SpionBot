@@ -3,7 +3,9 @@ import logging
 import os
 
 import httpx
+
 from telegram.request import HTTPXRequest
+
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -15,6 +17,7 @@ from telegram.ext import (
     PreCheckoutQueryHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -34,6 +37,7 @@ from handlers.commands import (
     get_word,
     handle_help_system_photo,
     handle_text_message,
+    handle_voice_message,
     join_room,
     leave_room,
     personal_account,
@@ -203,6 +207,7 @@ async def main():
     )
     for handler in handlers:
         application.add_handler(handler)
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     application.add_handler(
         MessageHandler(filters.PHOTO, handle_help_system_photo)
     )

@@ -3,6 +3,7 @@ import asyncio
 import html
 from dataclasses import dataclass,field
 from datetime import datetime, timezone, timedelta
+from  database.redis import set_room_prob
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional
@@ -19,7 +20,12 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+
 from utils.lower_memory import compress_to_bytes, bytes_to_input_file
+
+
+from database.redis import add_user_room,delete_user_room,set_room_prob,_load_room_probs,get_player,update_prob_user
+
 
 from const import MODE_BRAWL, MODE_CLASH, MODE_DOTA
 from database.actions import db
@@ -265,6 +271,46 @@ async def _broadcast_room_chat(
             )
         except Exception:
             continue
+
+
+async def _broadcast_room_voice(
+    room_id: str,
+    sender_id: int,
+    sender_user,
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not message or not getattr(message, "voice", None):
+        return
+
+    sender_name = _get_user_display_for_chat(sender_user)
+    safe_sender = html.escape(sender_name)
+    caption = f"🎤 <b>{safe_sender}</b>"
+
+    players = await db.get_room_players(room_id)
+    for player_id in players:
+        if player_id == sender_id:
+            continue
+        try:
+            await context.bot.copy_message(
+                chat_id=player_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                voice = message.voice
+                await context.bot.send_voice(
+                    chat_id=player_id,
+                    voice=voice.file_id,
+                    duration=voice.duration,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                continue
 
 
 async def _handle_referral_start(
@@ -581,13 +627,17 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "❌ Не удалось создать комнату. Попробуйте ещё раз."
         )
         return
+
     success = await db.create_room(room_id, user_id, DEFAULT_MODE, spy_count=1)
+
+    #создание вероятностной комнаты
 
     if not success:
         await update.message.reply_text("❌ Ошибка при создании комнаты.")
 
         return
 
+    set_room_prob(user_id, int(room_id))
     words, _ = get_words_and_cards_by_mode(DEFAULT_MODE)
 
     keyboard = get_room_mode_keyboard()
@@ -668,8 +718,8 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Комната переполнена!")
 
             return
-
     players = await db.get_room_players(room_id)
+    add_user_room(int(user_id),int(room_id),len(players))
     inline_keyboard = get_inline_keyboard('join_game')
     keyboard = get_room_keyboard()
     spy_count = room.get("spy_count", 1)
@@ -736,11 +786,21 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     mode = room.get("mode", DEFAULT_MODE)
 
+
     words, cards_map = get_words_and_cards_by_mode(mode)
 
     word = random.choice(words)
 
     card_url = cards_map.get(word, "")
+
+    users_prob = _load_room_probs(int(room_id))
+    if not users_prob:
+        set_room_prob(players, int(room_id), len(players))
+        users_prob = _load_room_probs(int(room_id))
+
+    spy = get_player(users_prob) if users_prob else random.choice(players)
+
+    update_prob_user(spy, int(room_id), len(players))
 
     requested_spy_count = room.get("spy_count", 1) or 1
     if not isinstance(requested_spy_count, int):
@@ -1126,7 +1186,8 @@ async def room_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Игроков: {len(players)}\n"
         f"🕵️ Шпионов: {spy_count}\n"
         f"🎮 Игра: {'идёт' if started else 'не начата'}\n\n"
-        "💬 Чтобы писать в чат комнаты — просто отправляйте обычные сообщения сюда."
+        "💬 Чтобы писать в чат комнаты — просто отправляйте обычные сообщения сюда.\n"
+        "🎤 Голосовые тоже можно отправлять — они придут всем в комнате."
     )
 
 
@@ -1138,11 +1199,13 @@ async def leave_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     room_id = await db.get_user_room(user_id)
 
+
     if not room_id:
         await update.message.reply_text("❌ Вы не в комнате!")
 
         return
 
+    delete_user_room(int(user_id), int(room_id))
     await db.remove_player_from_room(user_id, room_id)
 
     players = await db.get_room_players(room_id)
@@ -1874,6 +1937,32 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Войти: /join <ID>\n"
                 "Проверить комнату: /room"
             )
+
+
+@decorators.rate_limit(max_requests=5, period=1.0)
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.voice:
+        return
+
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await message.reply_text(
+            "❌ Вы не в комнате.\n"
+            "Создать: /create\n"
+            "Войти: /join <ID>\n"
+            "Проверить комнату: /room"
+        )
+        return
+
+    await _broadcast_room_voice(
+        room_id=room_id,
+        sender_id=user_id,
+        sender_user=update.effective_user,
+        message=message,
+        context=context,
+    )
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
