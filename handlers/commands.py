@@ -184,6 +184,46 @@ async def _broadcast_room_chat(
             continue
 
 
+async def _broadcast_room_voice(
+    room_id: str,
+    sender_id: int,
+    sender_user,
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not message or not getattr(message, "voice", None):
+        return
+
+    sender_name = _get_user_display_for_chat(sender_user)
+    safe_sender = html.escape(sender_name)
+    caption = f"🎤 <b>{safe_sender}</b>"
+
+    players = await db.get_room_players(room_id)
+    for player_id in players:
+        if player_id == sender_id:
+            continue
+        try:
+            await context.bot.copy_message(
+                chat_id=player_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                voice = message.voice
+                await context.bot.send_voice(
+                    chat_id=player_id,
+                    voice=voice.file_id,
+                    duration=voice.duration,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                continue
+
+
 async def _handle_referral_start(
     user_id: int,
     code: str,
@@ -1211,7 +1251,8 @@ async def room_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Игроков: {len(players)}\n"
         f"🕵️ Шпионов: {spy_count}\n"
         f"🎮 Игра: {'идёт' if started else 'не начата'}\n\n"
-        "💬 Чтобы писать в чат комнаты — просто отправляйте обычные сообщения сюда."
+        "💬 Чтобы писать в чат комнаты — просто отправляйте обычные сообщения сюда.\n"
+        "🎤 Голосовые тоже можно отправлять — они придут всем в комнате."
     )
 
 
@@ -1893,7 +1934,31 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Войти: /join <ID>\n"
                 "Проверить комнату: /room"
             )
-            
+
+@decorators.rate_limit(max_requests=5, period=1.0)
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.voice:
+        return
+
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await message.reply_text(
+            "❌ Вы не в комнате.\n"
+            "Создать: /create\n"
+            "Войти: /join <ID>\n"
+            "Проверить комнату: /room"
+        )
+        return
+
+    await _broadcast_room_voice(
+        room_id=room_id,
+        sender_id=user_id,
+        sender_user=update.effective_user,
+        message=message,
+        context=context,
+    )
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_chat:
