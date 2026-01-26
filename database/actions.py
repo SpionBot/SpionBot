@@ -134,9 +134,11 @@ class ButtonCommand(CreateDB):
                 room_id,
             )
 
-    async def get_public_rooms(self, limit: int = 10) -> List[dict]:
+    async def get_public_rooms(self, limit: int = 10, offset: int = 0) -> List[dict]:
         if limit < 1:
             return []
+        if offset < 0:
+            offset = 0
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -161,10 +163,30 @@ class ButtonCommand(CreateDB):
                 HAVING COUNT(players.user_id) < 15
                 ORDER BY rooms.created_at DESC
                 LIMIT $1
+                OFFSET $2
                 """,
                 limit,
+                offset,
             )
             return [dict(row) for row in rows]
+
+    async def get_public_rooms_count(self) -> int:
+        async with self.pool.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT rooms.id
+                    FROM rooms
+                    LEFT JOIN players ON rooms.id = players.room_id
+                    WHERE rooms.is_public = TRUE
+                      AND rooms.game_started = FALSE
+                      AND rooms.expires_at > NOW()
+                    GROUP BY rooms.id
+                    HAVING COUNT(players.user_id) < 15
+                ) AS open_rooms
+                """
+            )
+            return count or 0
 
     async def add_player_to_room(self, user_id: int, room_id: str) -> bool:
         async with self.pool.acquire() as conn:

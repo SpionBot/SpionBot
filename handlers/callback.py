@@ -23,6 +23,7 @@ from handlers.button import (
     get_restart_room_text
 
 )
+from handlers.commands import _show_public_rooms
 from database.redis import get_clue_hero
 from utils.decorators import hint_guard, room_locks
 from utils.gameMod import get_theme_name, get_words_and_cards_by_mode
@@ -212,6 +213,25 @@ async def public_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             pass
+
+
+async def public_rooms_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    _, action, page_raw = parts
+    if action != "page":
+        return
+    try:
+        page = int(page_raw)
+    except ValueError:
+        return
+    await query.answer()
+    await _show_public_rooms(update, context, page=page, edit_message=True)
 
 
 @hint_guard

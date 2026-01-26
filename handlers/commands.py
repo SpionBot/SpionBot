@@ -1,6 +1,7 @@
 import random
 import asyncio
 import html
+import math
 from dataclasses import dataclass,field
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
@@ -83,6 +84,7 @@ class SingleModeSession:
 SINGLE_MODE_SESSIONS: Dict[int, SingleModeSession] = {}
 
 MAX_ROOM_CHAT_LEN = 800
+PUBLIC_ROOMS_PAGE_SIZE = 5
 
 
 async def show_main_menu(
@@ -526,44 +528,98 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=build_spy_count_keyboard(room_id),
     )
 
-async def _show_public_rooms(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    limit: int = 10,
-) -> None:
-    chat_id = (
-        update.effective_chat.id if update.effective_chat else update.effective_user.id
-    )
-    rooms = await db.get_public_rooms(limit=limit)
-    if not rooms:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="«🔑 Открытых комнат пока нет. Можно зайти по ID: /join <ID>.»",
-        )
-        return
-
+def _build_public_rooms_page(
+    rooms: list[dict],
+    page: int,
+    total_pages: int,
+) -> tuple[str, InlineKeyboardMarkup]:
     lines = ["🚪 Открытые комнаты (нажмите, чтобы зайти):"]
-    keyboard_rows = []
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
     for room in rooms:
         room_id = room["id"]
         player_count = room.get("player_count", 0) or 0
         mode = room.get("mode") or DEFAULT_MODE
-        lines.append(f"- {room_id} | {player_count}/15 | {mode}")
+        
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    f"{room_id} ({player_count}/15)",
+                    f"{room_id} ({player_count}/15) {mode}" ,
                     callback_data=f"public_join:{room_id}",
                 )
             ]
         )
 
+    if total_pages > 1:
+        lines.append(f"Страница {page}/{total_pages}")
+
     lines.append("🔑 Чтобы зайти в закрытую комнату: /join <ID>.")
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav_buttons.append(
+            InlineKeyboardButton("⬅️", callback_data=f"public_rooms:page:{page - 1}")
+        )
+    if page < total_pages:
+        nav_buttons.append(
+            InlineKeyboardButton("➡️", callback_data=f"public_rooms:page:{page + 1}")
+        )
+    if nav_buttons:
+        keyboard_rows.append(nav_buttons)
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
+
+async def _show_public_rooms(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 1,
+    per_page: int = PUBLIC_ROOMS_PAGE_SIZE,
+    edit_message: bool = False,
+) -> None:
+    chat_id = (
+        update.effective_chat.id if update.effective_chat else update.effective_user.id
+    )
+    message = update.effective_message
+    if page < 1:
+        page = 1
+    if per_page < 1:
+        per_page = PUBLIC_ROOMS_PAGE_SIZE
+
+    total_rooms = await db.get_public_rooms_count()
+    if total_rooms <= 0:
+        text = "🔑 Открытых комнат пока нет. Можно зайти по ID: /join <ID>."
+        if edit_message and message:
+            try:
+                await message.edit_text(text=text, reply_markup=None)
+            except BadRequest:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    total_pages = max(1, math.ceil(total_rooms / per_page))
+    if page > total_pages:
+        page = total_pages
+
+    offset = (page - 1) * per_page
+    rooms = await db.get_public_rooms(limit=per_page, offset=offset)
+    if not rooms and page > 1:
+        page = max(1, total_pages - 1)
+        offset = (page - 1) * per_page
+        rooms = await db.get_public_rooms(limit=per_page, offset=offset)
+
+    text, markup = _build_public_rooms_page(rooms, page, total_pages)
+    if edit_message and message:
+        try:
+            await message.edit_text(text=text, reply_markup=markup)
+        except BadRequest:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        return
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        text=text,
+        reply_markup=markup,
     )
 
 
