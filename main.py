@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 
+import httpx
+from telegram.request import HTTPXRequest
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -30,11 +32,13 @@ from handlers.commands import (
     donate_amount_callback,
     error_handler,
     get_word,
+    handle_help_system_photo,
     handle_text_message,
     join_room,
     leave_room,
     personal_account,
     precheckout_callback,
+    report_callback,
     restart_game,
     room_status,
     rules,
@@ -64,6 +68,47 @@ logging.basicConfig(
 nest_asyncio.apply()
 logger = logging.getLogger(__name__)
 
+def _httpx_supports_proxy_kw() -> bool:
+    parts = []
+    for part in httpx.__version__.split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        parts.append(int(num))
+    return tuple(parts[:2]) >= (0, 28)
+
+
+def _normalize_httpx_proxy(proxy):
+    if not isinstance(proxy, dict):
+        return proxy
+    for key in ("all", "all://", "http://", "https://", "http", "https"):
+        value = proxy.get(key)
+        if value:
+            return value
+    for value in proxy.values():
+        if value:
+            return value
+    return None
+
+
+class CompatHTTPXRequest(HTTPXRequest):
+    def _build_client(self) -> httpx.AsyncClient:
+        kwargs = dict(self._client_kwargs)
+        proxy = kwargs.pop("proxies", None)
+        if proxy is not None:
+            if _httpx_supports_proxy_kw():
+                proxy = _normalize_httpx_proxy(proxy)
+                if proxy is not None:
+                    kwargs["proxy"] = proxy
+            else:
+                kwargs["proxies"] = proxy
+        return httpx.AsyncClient(**kwargs)
+
 async def main():
     API_TOKEN = os.getenv("API_TOKEN")
     DATABASE_URL = os.getenv("DATABASE_URL")
@@ -87,7 +132,11 @@ async def main():
     asyncio.create_task(generate_clue())
     asyncio.create_task(update_connect())
     asyncio.create_task(cleanup_single_mode())
-    application = Application.builder().token(API_TOKEN).build()
+    request = CompatHTTPXRequest()
+    builder = Application.builder().token(API_TOKEN).request(request)
+    if hasattr(builder, "get_updates_request"):
+        builder = builder.get_updates_request(CompatHTTPXRequest())
+    application = builder.build()
     handlers = [
         CommandHandler("start", start),
         CommandHandler("create", create_room),
@@ -144,6 +193,9 @@ async def main():
     application.add_handler(
         CallbackQueryHandler(set_spies_callback, pattern=r"^spies:set:")
     )
+    application.add_handler(
+        CallbackQueryHandler(report_callback, pattern=r"^report:")
+    )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(
@@ -151,6 +203,9 @@ async def main():
     )
     for handler in handlers:
         application.add_handler(handler)
+    application.add_handler(
+        MessageHandler(filters.PHOTO, handle_help_system_photo)
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
