@@ -34,6 +34,7 @@ class CreateDB:
                     id VARCHAR(10) PRIMARY KEY,
                     creator_id BIGINT NOT NULL,
                     mode VARCHAR(20) DEFAULT 'clash',
+                    is_public BOOLEAN NOT NULL DEFAULT FALSE,
                     word VARCHAR(100),
                     spy_id BIGINT,
                     spy_count INTEGER NOT NULL DEFAULT 1,
@@ -47,6 +48,11 @@ class CreateDB:
             await conn.execute(
                 "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS spy_count INTEGER NOT NULL DEFAULT 1"
             )
+
+            await conn.execute(
+                "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS players (
@@ -67,9 +73,17 @@ class CreateDB:
                     hard_hints INTEGER DEFAULT 0,
                     medium_hints INTEGER DEFAULT 0,
                     easy_hints INTEGER DEFAULT 0,
+                    games_played INTEGER NOT NULL DEFAULT 0,
+                    spy_games_played INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute(
+                "ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS games_played INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute(
+                "ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS spy_games_played INTEGER NOT NULL DEFAULT 0"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS referrals (
                     user_id BIGINT PRIMARY KEY,

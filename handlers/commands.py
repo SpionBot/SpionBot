@@ -1,9 +1,9 @@
 import random
 import asyncio
 import html
+import math
 from dataclasses import dataclass,field
 from datetime import datetime, timezone, timedelta
-from  database.redis import set_room_prob
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional
@@ -19,6 +19,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
+
 
 
 from utils.lower_memory import compress_to_bytes, bytes_to_input_file
@@ -94,6 +95,8 @@ class SingleModeSession:
 SINGLE_MODE_SESSIONS: Dict[int, SingleModeSession] = {}
 
 MAX_ROOM_CHAT_LEN = 800
+PUBLIC_ROOMS_PAGE_SIZE = 5
+
 MAX_REPORT_TEXT_LEN = 3800
 MAX_REPORT_CAPTION_LEN = 900
 
@@ -617,6 +620,7 @@ async def single_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @decorators.private_chat_only()
 async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    is_public = False
     for _ in range(10):
         room_id = str(random.randint(1000, 9999))
         room = await db.get_room(room_id)
@@ -627,19 +631,18 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "❌ Не удалось создать комнату. Попробуйте ещё раз."
         )
         return
+    success = await db.create_room(
+        room_id, user_id, DEFAULT_MODE, spy_count=1, is_public=is_public
+    )
 
-    success = await db.create_room(room_id, user_id, DEFAULT_MODE, spy_count=1)
-
-    #создание вероятностной комнаты
 
     if not success:
         await update.message.reply_text("❌ Ошибка при создании комнаты.")
 
         return
 
-    set_room_prob(user_id, int(room_id))
     words, _ = get_words_and_cards_by_mode(DEFAULT_MODE)
-
+    
     keyboard = get_room_mode_keyboard()
     inline_keyboard = get_inline_keyboard('start_game')
     await update.message.reply_text(
@@ -648,7 +651,7 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=keyboard,
     )
     await update.message.reply_text(
-        text=get_message_start(room_id, 1, get_theme_name(DEFAULT_MODE), spy_count=1),
+        text=get_message_start(False,room_id, 1, get_theme_name(DEFAULT_MODE), spy_count=1),
         parse_mode=ParseMode.HTML,
         reply_markup=inline_keyboard,
     )
@@ -657,19 +660,121 @@ async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=build_spy_count_keyboard(room_id),
     )
 
+def _build_public_rooms_page(
+    rooms: list[dict],
+    page: int,
+    total_pages: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    lines = ["🚪 Открытые комнаты (нажмите, чтобы зайти):"]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for room in rooms:
+        room_id = room["id"]
+        player_count = room.get("player_count", 0) or 0
+        mode = room.get("mode") or DEFAULT_MODE
+        
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{room_id} ({player_count}/15) {mode}" ,
+                    callback_data=f"public_join:{room_id}",
+                )
+            ]
+        )
+
+    if total_pages > 1:
+        lines.append(f"Страница {page}/{total_pages}")
+
+    lines.append("🔑 Чтобы зайти в закрытую комнату: /join <ID>.")
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav_buttons.append(
+            InlineKeyboardButton("⬅️", callback_data=f"public_rooms:page:{page - 1}")
+        )
+    if page < total_pages:
+        nav_buttons.append(
+            InlineKeyboardButton("➡️", callback_data=f"public_rooms:page:{page + 1}")
+        )
+    if nav_buttons:
+        keyboard_rows.append(nav_buttons)
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
+
+async def _show_public_rooms(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 1,
+    per_page: int = PUBLIC_ROOMS_PAGE_SIZE,
+    edit_message: bool = False,
+) -> None:
+    chat_id = (
+        update.effective_chat.id if update.effective_chat else update.effective_user.id
+    )
+    message = update.effective_message
+    if page < 1:
+        page = 1
+    if per_page < 1:
+        per_page = PUBLIC_ROOMS_PAGE_SIZE
+
+    total_rooms = await db.get_public_rooms_count()
+    if total_rooms <= 0:
+        text = "🔑 Открытых комнат пока нет. Можно зайти по ID: /join <ID>."
+        if edit_message and message:
+            try:
+                await message.edit_text(text=text, reply_markup=None)
+            except BadRequest:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    total_pages = max(1, math.ceil(total_rooms / per_page))
+    if page > total_pages:
+        page = total_pages
+
+    offset = (page - 1) * per_page
+    rooms = await db.get_public_rooms(limit=per_page, offset=offset)
+    if not rooms and page > 1:
+        page = max(1, total_pages - 1)
+        offset = (page - 1) * per_page
+        rooms = await db.get_public_rooms(limit=per_page, offset=offset)
+
+    text, markup = _build_public_rooms_page(rooms, page, total_pages)
+    if edit_message and message:
+        try:
+            await message.edit_text(text=text, reply_markup=markup)
+        except BadRequest:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+    )
+
+
 
 @subscription_required
 @decorators.rate_limit()
 @decorators.private_chat_only()
 async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    args = context.args or []
+    if (
+        len(args) == 0
+        and (not update.message or not update.message.text or not update.message.text.isdigit())
+    ):
+        await _show_public_rooms(update, context)
+        return
 
-    if update.message.text == "🔗 Присоединиться":
+    if update.message and update.message.text == "🔗 Присоединиться":
         await update.message.reply_text("📝 Введите ID комнаты для присоединения:")
 
         return
 
-    if len(context.args) == 0 and update.message.text != "🔗 Присоединиться":
+    if len(args) == 0 and update.message and update.message.text != "🔗 Присоединиться":
         if update.message.text and update.message.text.isdigit():
             room_id = update.message.text
 
@@ -681,7 +786,7 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     else:
-        room_id = context.args[0]
+        room_id = args[0]
 
     lock = room_locks.get_lock(room_id)
 
@@ -718,10 +823,14 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Комната переполнена!")
 
             return
+
     players = await db.get_room_players(room_id)
-    add_user_room(int(user_id),int(room_id),len(players))
-    inline_keyboard = get_inline_keyboard('join_game')
-    keyboard = get_room_keyboard()
+    inline_keyboard = get_inline_keyboard('join_game') 
+
+    stat = await db.get_room(room_id)
+
+    status_room = stat['is_public']
+    keyboard = get_room_keyboard(False,status_room)
     spy_count = room.get("spy_count", 1)
     await update.message.reply_text(
         text = f"✅ Вы присоединились к комнате {room_id}!\n\n",
@@ -729,7 +838,7 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
     await update.message.reply_text(
-        text = get_join_room_text(room_id,len(players),get_theme_name(DEFAULT_MODE), spy_count=spy_count),
+        text = get_join_room_text(status_room,room_id,len(players),get_theme_name(DEFAULT_MODE), spy_count=spy_count),
         parse_mode=ParseMode.HTML,
         reply_markup=inline_keyboard,
     )
@@ -745,6 +854,54 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_public(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Комнаты не существует.")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена.")
+        return
+    if room.get("is_public"):
+        await update.message.reply_text("✅ Комната не видна игрокам.")
+        return
+    await db.update_room_public(room_id, True)
+    await update.message.reply_text(
+        "👥 Комната теперь общедоступна. Она появится в списке рассылки /join.",
+            reply_markup=get_room_keyboard(True,True)
+    )
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Комнаты не существует")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена.")
+        return
+    if not room.get("is_public"):
+        await update.message.reply_text("✅ Комната не видна игрокам.")
+        return
+    await db.update_room_public(room_id, False)
+    await update.message.reply_text(
+        "👤 Комната теперь приватная. Она не будет отображаться в списке /join.",
+        reply_markup=get_room_keyboard(True,False)
+    )
+
+
 @decorators.game_not_started()
 @subscription_required
 @decorators.rate_limit()
@@ -757,7 +914,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     room_id = await db.get_user_room(user_id)
 
-    if not room_id:
+    if not room_id: 
         logger.info(f"❌ USER {user_id} не в комнате")
 
         await update.message.reply_text("❌ Вы не в комнате!")
@@ -786,21 +943,11 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     mode = room.get("mode", DEFAULT_MODE)
 
-
     words, cards_map = get_words_and_cards_by_mode(mode)
 
     word = random.choice(words)
 
     card_url = cards_map.get(word, "")
-
-    users_prob = _load_room_probs(int(room_id))
-    if not users_prob:
-        set_room_prob(players, int(room_id), len(players))
-        users_prob = _load_room_probs(int(room_id))
-
-    spy = get_player(users_prob) if users_prob else random.choice(players)
-
-    update_prob_user(spy, int(room_id), len(players))
 
     requested_spy_count = room.get("spy_count", 1) or 1
     if not isinstance(requested_spy_count, int):
@@ -812,7 +959,6 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"ℹ️ Кол-во шпионов скорректировано до {spy_count} (игроков: {len(players)})."
         )
         await db.update_room_spy_count(room_id, spy_count)
-
     spies = set(random.sample(players, k=spy_count))
     primary_spy = next(iter(spies))
 
@@ -823,6 +969,15 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for player_id in players:
         if player_id in spies:
             await db.update_player_role(player_id, room_id, "шпион")
+            await db.update_stat_game_vil(player_id)
+            account = await db.get_user_account(player_id)
+            if not account:
+                easy = medium = hard = 0
+            else:
+                easy = account["easy_hints"]
+                medium = account["medium_hints"]
+                hard = account["hard_hints"]
+            keyboard_inline = get_game_inline_button(easy, medium, hard)
 
             account = await db.get_user_account(player_id)
             if not account:
@@ -879,7 +1034,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         else:
             await db.update_player_role(player_id, room_id, "мирный", word, card_url)
-
+            await db.update_stat_game(player_id)
             if card_url:
                 cached_file_id = await db.get_cached_image(card_url)
 
@@ -1008,9 +1163,11 @@ async def restart_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words, _ = get_words_and_cards_by_mode(room["mode"])
 
     inline_keyboard = get_inline_keyboard('restart_game')
+    
+    status = await db.get_room(room_id)
 
     await update.message.reply_text(
-        get_restart_room_text(room_id,players,room),
+        get_restart_room_text(status["is_public"],room_id,players,room),
         parse_mode=ParseMode.HTML,
         reply_markup=inline_keyboard,
     )
@@ -1199,13 +1356,11 @@ async def leave_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     room_id = await db.get_user_room(user_id)
 
-
     if not room_id:
         await update.message.reply_text("❌ Вы не в комнате!")
 
         return
 
-    delete_user_room(int(user_id), int(room_id))
     await db.remove_player_from_room(user_id, room_id)
 
     players = await db.get_room_players(room_id)
@@ -1295,9 +1450,11 @@ async def show_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
         room = await db.get_room(room_id)
 
         mode = room.get("mode", DEFAULT_MODE) if room else DEFAULT_MODE
+        stat = await db.get_room(room_id)
 
-        keyboard = get_room_keyboard()
-
+        admin = True if stat['creator_id'] == user_id else False
+        status_room = stat['is_public']
+        keyboard = get_room_keyboard(admin,status_room)
     else:
         mode = DEFAULT_MODE
 
@@ -1369,27 +1526,40 @@ async def _validate_room_for_mode_change(update: Update):
 
 
 async def _announce_mode_change(update: Update, mode: str):
-    words, _ = get_words_and_cards_by_mode(mode)
-    entity_label = MODE_ENTITY_LABELS.get(mode, "вариантов")
+    user_id = update.effective_user.id
+    room_info = await _validate_room_for_mode_change(update)
+    if not room_info:
+        return
+    room_id, _ = room_info
+    stat = await db.get_room(room_id)
+
+    admin = True if stat['creator_id'] == user_id else False
+    status_room = stat['is_public']
+    keyboard = get_room_keyboard(admin,status_room)
     await update.message.reply_text(
         (
             f"✅ Режим изменён на {get_theme_name(mode)}.\n"
             "▶️ Начать игру и 🔄 Перезапустить уже доступны ниже."
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=get_room_keyboard(),
+        reply_markup=keyboard,
     )
 
 
 async def _update_room_mode(update: Update, mode: str):
+    user_id = update.effective_user.id
     room_info = await _validate_room_for_mode_change(update)
     if not room_info:
         return
     room_id, room = room_info
+    stat = await db.get_room(room_id)
+    admin = True if stat['creator_id'] == user_id else False
+    status_room = stat['is_public']
+    keyboard = get_room_keyboard(admin,status_room)
     if room["mode"] == mode:
         await update.message.reply_text(
             f"ℹ️ Режим уже {get_theme_name(mode)}.",
-            reply_markup=get_room_keyboard(),
+            reply_markup=keyboard,
         )
         return
 
@@ -1631,13 +1801,39 @@ async def admin_global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _build_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Запустить", callback_data="admin_broadcast:confirm"
+                ),
+                InlineKeyboardButton("❌ Отмена", callback_data="admin_broadcast:cancel"),
+            ]
+        ]
+    )
+
+
+async def admin_broadcast_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN:
         await update.message.reply_text("❌ Нет доступа.")
         return
+    message = update.effective_message
+    if not message:
+        return
+    await message.reply_text(
+        "⚠️ Подтвердите запуск рассылки.\nСообщение получат все пользователи.",
+        reply_markup=_build_broadcast_confirm_keyboard(),
+    )
 
-    status_msg = await update.message.reply_text("⏳ Запускаю рассылку...")
+
+async def _run_broadcast(context: ContextTypes.DEFAULT_TYPE, status_msg):
+    if status_msg:
+        try:
+            await status_msg.edit_text("⏳ Запускаю рассылку...")
+        except Exception:
+            status_msg = None
     user_ids = await db.get_all_known_user_ids()
 
     text = (
@@ -1670,9 +1866,49 @@ async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAUL
         if idx % 25 == 0:
             await asyncio.sleep(0.2)
 
-    await status_msg.edit_text(
-        f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
-    )
+    if status_msg:
+        try:
+            await status_msg.edit_text(
+                f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
+            )
+        except Exception:
+            pass
+
+
+async def admin_broadcast_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+    status_msg = await message.reply_text("⏳ Запускаю рассылку...")
+    await _run_broadcast(context, status_msg)
+
+
+async def admin_broadcast_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if not query:
+        return
+    user_id = query.from_user.id
+    if user_id not in ADMIN:
+        await query.answer("❌ Нет доступа.", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":", 1)[-1]
+    if action == "cancel":
+        try:
+            await query.message.edit_text("❌ Рассылка отменена.")
+        except Exception:
+            pass
+        return
+    if action != "confirm":
+        return
+    await _run_broadcast(context, query.message)
 
 
 async def single_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1872,6 +2108,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await join_room(update, context)
     elif text in MODE_SELECTION_LABELS:
         await _update_room_mode(update, MODE_SELECTION_LABELS[text])
+    elif text == "🔒 Закрыть комнату":
+        await make_room_private(update,context)
+    elif text == "🌐 Открыть комнату":
+        await make_room_public(update,context)
     elif text == "▶️ Начать игру":
         await start_game(update, context)
     elif text == "🔄 Перезапустить":
@@ -1938,7 +2178,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Проверить комнату: /room"
             )
 
-
 @decorators.rate_limit(max_requests=5, period=1.0)
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -1963,8 +2202,6 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         message=message,
         context=context,
     )
-
-
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_chat:
@@ -2108,6 +2345,7 @@ async def referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referral_link = (
         f"https://t.me/{bot_username}?start={referral_code}" if bot_username else None
     )
+    print('referral_link:',referral_link)
     total_referrals = await db.get_referral_count(user_id)
     earned_stars = total_referrals * 2
     lines = [
@@ -2135,7 +2373,10 @@ async def referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append(
         [InlineKeyboardButton("🏠 Главное меню", callback_data="cabinet:menu")]
     )
-    await update.message.reply_text(
+    message = update.effective_message
+    if not message:
+        return
+    await message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2150,7 +2391,7 @@ async def personal_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance, hard_count, medium_count, easy_count = await _get_account_summary(
         user_id
     )
-
+    count_game_peac,count_game_vil = await db.get_stat_game(user_id)
     await update.message.reply_text(
         _personal_account_text(
             update.effective_user,
@@ -2158,6 +2399,8 @@ async def personal_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hard_count,
             medium_count,
             easy_count,
+            count_game_peac,
+            count_game_vil
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=_build_cabinet_keyboard(),
@@ -2314,22 +2557,30 @@ async def cabinet_action_callback(
         )
         return
 
-    if action == "donate":
+    elif action == "donate":
         await query.message.edit_text(
             "💳 Выберите, сколько звезд хотите пополнить:", reply_markup=_build_donate_keyboard()
         )
         return
 
-    if action == "account":
+    elif action == "account":
         balance, hard, medium, easy = await _get_account_summary(query.from_user.id)
+        count_game_peac, count_game_vil = await db.get_stat_game(query.from_user.id)
         await query.message.edit_text(
             _personal_account_text(
-                query.from_user, balance, hard, medium, easy
+                query.from_user,
+                balance,
+                hard,
+                medium,
+                easy,
+                count_game_peac,
+                count_game_vil,
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=_build_cabinet_keyboard(),
         )
-
+    elif action == "referal":
+        await referral_system(update, context)
 
 async def donate_amount_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
