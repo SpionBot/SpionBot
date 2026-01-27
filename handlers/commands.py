@@ -21,7 +21,11 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 
+from utils.lower_memory import compress_to_bytes, bytes_to_input_file
+
+
 from database.redis import add_user_room,delete_user_room,set_room_prob,_load_room_probs,get_player,update_prob_user
+
 
 from const import MODE_BRAWL, MODE_CLASH, MODE_DOTA
 from database.actions import db
@@ -32,11 +36,14 @@ from handlers.button import (
     get_room_mode_keyboard,
     get_restart_room_text,
     get_join_room_text,
+    get_keyboard_report,
+    get_report_inline_keyboard,
     build_spy_count_keyboard,
     _build_cabinet_keyboard,
     _build_hint_selection_keyboard,
     _personal_account_text,
-    _build_donate_keyboard
+    _build_donate_keyboard,
+
 )
 from utils.decorators import (
     create_decorators,
@@ -87,6 +94,86 @@ class SingleModeSession:
 SINGLE_MODE_SESSIONS: Dict[int, SingleModeSession] = {}
 
 MAX_ROOM_CHAT_LEN = 800
+MAX_REPORT_TEXT_LEN = 3800
+MAX_REPORT_CAPTION_LEN = 900
+
+
+def _normalize_report_file(report: dict) -> Optional[bytes]:
+    file_bytes = report.get("file")
+    if file_bytes is None:
+        file_bytes = report.get("files")
+    if isinstance(file_bytes, memoryview):
+        return file_bytes.tobytes()
+    return file_bytes
+
+
+def _format_report_time(value) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value) if value else ""
+
+
+def _truncate_report_body(raw_text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    raw = (raw_text or "").strip() or "Без текста."
+    if len(raw) <= max_len:
+        return html.escape(raw)
+    trimmed = raw[: max(0, max_len - 1)] + "…"
+    escaped = html.escape(trimmed)
+    while len(escaped) > max_len and max_len > 1:
+        trimmed = trimmed[:-2] + "…"
+        escaped = html.escape(trimmed)
+    return escaped[:max_len]
+
+
+def _build_report_text(
+    report: dict, index: int, total: int, max_len: Optional[int] = None
+) -> str:
+    user_id = report.get("user_id", "—")
+    content = report.get("content") or ""
+    time_text = _format_report_time(report.get("updated_at"))
+    header = f"<b>Жалоба {index + 1}/{total}</b>\n"
+    meta = f"ID: <code>{user_id}</code>\n"
+    if time_text:
+        meta += f"Дата: {time_text}\n"
+    base = header + meta + "\n"
+    if max_len is None:
+        max_len = MAX_REPORT_TEXT_LEN
+    available = max_len - len(base)
+    body = _truncate_report_body(content, max(0, available))
+    return base + body
+
+
+async def _send_report_message(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    report: dict,
+    index: int,
+    total: int,
+):
+    report_user_id = report.get("user_id")
+    keyboard = get_report_inline_keyboard(index, total, report_user_id)
+    file_bytes = _normalize_report_file(report)
+    if file_bytes:
+        caption = _build_report_text(
+            report, index, total, max_len=MAX_REPORT_CAPTION_LEN
+        )
+        photo = bytes_to_input_file(file_bytes)
+        return await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    text_body = _build_report_text(report, index, total, max_len=MAX_REPORT_TEXT_LEN)
+    return await context.bot.send_message(
+        chat_id=chat_id,
+        text=text_body,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 
 async def show_main_menu(
@@ -114,7 +201,7 @@ async def show_main_menu(
         f"• /join &lt;ID комнаты&gt; — присоединиться к комнате\n"
         f"• /startgame — начать игру\n"
         f"• /single — игра с 1 устройства\n\n"
-        f"👑 Игру создали It tut Денис и Артур!"
+        f"👑 Игру создали Денис и Арутр!"
     )
     text = f"{notice}\n\n{base_text}" if notice else base_text
     await context.bot.send_message(
@@ -1383,6 +1470,132 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    reports = await db.result_report()
+    if not reports:
+        await update.message.reply_text("Заявок нет.")
+        return
+    await _send_report_message(
+        chat_id=update.effective_chat.id,
+        context=context,
+        report=reports[0],
+        index=0,
+        total=len(reports),
+    )
+
+
+async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    user_id = query.from_user.id
+    if user_id not in ADMIN:
+        await query.answer("❌ Нет доступа.", show_alert=True)
+        return
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) < 2:
+        return
+    action = parts[1]
+    await query.answer()
+
+    if action == "noop":
+        return
+
+    if action == "delete":
+        if len(parts) < 4:
+            return
+        try:
+            report_user_id = int(parts[2])
+            index = int(parts[3])
+        except ValueError:
+            return
+        await db.delete_user_report(report_user_id)
+        reports = await db.result_report()
+        if not reports:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Заявок нет.",
+            )
+            return
+        if index >= len(reports):
+            index = max(0, len(reports) - 1)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await _send_report_message(
+            chat_id=query.message.chat_id,
+            context=context,
+            report=reports[index],
+            index=index,
+            total=len(reports),
+        )
+        return
+
+    if action == "reply":
+        if len(parts) < 4:
+            return
+        try:
+            report_user_id = int(parts[2])
+            index = int(parts[3])
+        except ValueError:
+            return
+        context.user_data["awaiting_report_reply"] = {
+            "user_id": report_user_id,
+            "index": index,
+        }
+        await query.message.reply_text(
+            f"Введите сообщение пользователю <code>{report_user_id}</code>.\n"
+            f"Для отмены нажмите «⬅️ Назад».",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "nav":
+        if len(parts) < 3:
+            return
+        try:
+            index = int(parts[2])
+        except ValueError:
+            return
+        reports = await db.result_report()
+        if not reports:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Заявок нет.",
+            )
+            return
+        if index < 0:
+            index = 0
+        if index >= len(reports):
+            index = len(reports) - 1
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await _send_report_message(
+            chat_id=query.message.chat_id,
+            context=context,
+            report=reports[index],
+            index=index,
+            total=len(reports),
+        )
+        return
+
+
 async def admin_single_mode_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN:
@@ -1618,6 +1831,26 @@ async def single_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 @decorators.rate_limit(max_requests=5, period=1.0)
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    if context.user_data.get("awaiting_report_reply"):
+        reply_state = context.user_data.get("awaiting_report_reply") or {}
+        if text == "⬅️ Назад":
+            context.user_data.pop("awaiting_report_reply", None)
+            await update.message.reply_text("Отправка отменена.")
+            return
+        if update.effective_user.id not in ADMIN:
+            context.user_data.pop("awaiting_report_reply", None)
+            return
+        target_user_id = reply_state.get("user_id")
+        if not target_user_id:
+            context.user_data.pop("awaiting_report_reply", None)
+            return
+        try:
+            await context.bot.send_message(chat_id=target_user_id, text=text)
+            await update.message.reply_text("Сообщение отправлено.")
+        except Exception:
+            await update.message.reply_text("Не удалось отправить сообщение.")
+        context.user_data.pop("awaiting_report_reply", None)
+        return
     if context.user_data.get("awaiting_custom_donate_amount"):
         amount_text = text.strip()
         if amount_text.isdigit():
@@ -1630,8 +1863,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("Введите сумму числом.")
         return
-    # user_id = update.effective_user.id не используется в функции
-
+    if context.user_data.get("awaiting_help_system"):
+        await _process_help_system_input(update, context)
+        return
     if text == "🎮 Создать комнату":
         await create_room(update, context)
     elif text == "🔗 Присоединиться":
@@ -1656,9 +1890,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await leave_room(update, context)
     elif text == "👤 Личный кабинет":
         await personal_account(update, context)
-    elif text == "🎁 Реферальная система":
-        await referral_system(update, context)
-    elif text == "ℹ️ Помощь" or text == "🏠 Главное меню":
+    elif text == "❓Поддержка":
+        await help_system(update, context)
+    elif text == "🏠 Главное меню":
         user_id = update.effective_user.id
         room_id = await db.get_user_room(user_id)
 
@@ -1674,6 +1908,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await admin_global_stats(update, context)
     elif text == "📢 Запустить рассылку":
         await admin_broadcast_subscribe(update, context)
+    elif text == "👤 Жалобы":
+        await admin_reports(update, context)
     elif text == "⬅️ Назад":
         user_id = update.effective_user.id
         if user_id in ADMIN:
@@ -2129,3 +2365,82 @@ async def donate_amount_callback(
         f"🧾 Формирую счёт на {amount} ⭐. Проверьте чат.",
         reply_markup=_build_cabinet_keyboard(),
     )
+
+async def _process_help_system_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user_id = update.effective_user.id
+    message = update.message
+    if not message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
+    text_input = (message.text or message.caption or "").strip()
+
+    if text_input == "⬅️ Назад":
+        context.user_data.pop("awaiting_help_system", None)
+        await message.reply_text("❌ Заявка отменена.")
+        await show_main_menu(user_id, context)
+        return
+
+
+    image_bytes = None
+    if message.photo:
+        file = await message.photo[-1].get_file()
+        if hasattr(file, "download_as_bytearray"):
+            raw = await file.download_as_bytearray()
+            image_bytes = bytes(raw)
+        else:
+            buffer = BytesIO()
+            await file.download_to_memory(out=buffer)
+            image_bytes = buffer.getvalue()
+
+    context.user_data["imga_input"] = image_bytes
+    context.user_data["text_input"] = text_input
+    context.user_data.pop("awaiting_help_system", None)
+
+    result_image = (
+        compress_to_bytes(image_bytes, image_format="WEBP")
+        if image_bytes
+        else None
+    )
+    await db.add_user_report(user_id, result_image, text_input)
+
+    keyboard = get_main_keyboard("😈 Админ Панель")
+    
+    await message.reply_text(
+        "✅ Спасибо! Сообщение отправлено в поддержку.",
+        reply_markup=keyboard
+    )
+
+
+@decorators.rate_limit(max_requests=5, period=1.0)
+async def handle_help_system_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not context.user_data.get("awaiting_help_system"):
+        return
+    await _process_help_system_input(update, context)
+
+
+@subscription_required
+@decorators.rate_limit()
+async def help_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    context.user_data["awaiting_help_system"] = True
+    await context.bot.send_message(
+                chat_id=user_id,
+                text = (
+                    "Кнопка поддержки позволяет отправить сообщение для общения с командой 💬\n"
+                    "Все обращения обрабатываются администраторами 👩‍💻\n"
+                    "Вы также можете прикреплять фотографии 📸\n\n"
+                    "Кроме того, сюда можно отправлять ваши идеи по улучшению бота 💡\n"
+                    "Лучшие предложения будут использованы,создатель получит награду!💰✨"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_keyboard_report()
+    )
+async def check_reports_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    result_report = await db.get_report_users()

@@ -3,6 +3,9 @@ import logging
 import os
 
 import httpx
+
+from telegram.request import HTTPXRequest
+
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -32,12 +35,14 @@ from handlers.commands import (
     donate_amount_callback,
     error_handler,
     get_word,
+    handle_help_system_photo,
     handle_text_message,
     handle_voice_message,
     join_room,
     leave_room,
     personal_account,
     precheckout_callback,
+    report_callback,
     restart_game,
     room_status,
     rules,
@@ -67,7 +72,6 @@ logging.basicConfig(
 nest_asyncio.apply()
 logger = logging.getLogger(__name__)
 
-# httpx 0.28 renamed "proxies" -> "proxy"; keep compatibility with PTB 20.7.
 def _httpx_supports_proxy_kw() -> bool:
     parts = []
     for part in httpx.__version__.split("."):
@@ -193,6 +197,9 @@ async def main():
     application.add_handler(
         CallbackQueryHandler(set_spies_callback, pattern=r"^spies:set:")
     )
+    application.add_handler(
+        CallbackQueryHandler(report_callback, pattern=r"^report:")
+    )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(
@@ -201,6 +208,9 @@ async def main():
     for handler in handlers:
         application.add_handler(handler)
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    application.add_handler(
+        MessageHandler(filters.PHOTO, handle_help_system_photo)
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )

@@ -85,4 +85,12 @@ class CreateDB:
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_reports (
+                    user_id BIGINT PRIMARY KEY,
+                    content TEXT  ,
+                    file BYTEA,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 db_init = CreateDB()
