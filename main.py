@@ -4,6 +4,8 @@ import os
 
 import httpx
 
+from telegram.request import HTTPXRequest
+
 import nest_asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -34,6 +36,7 @@ from handlers.commands import (
     donate_amount_callback,
     error_handler,
     get_word,
+    handle_help_system_photo,
     handle_text_message,
     handle_voice_message,
     join_room,
@@ -42,6 +45,7 @@ from handlers.commands import (
     make_room_public,
     personal_account,
     precheckout_callback,
+    report_callback,
     restart_game,
     room_status,
     rules,
@@ -214,6 +218,7 @@ async def main():
     )
     application.add_handler(
         CallbackQueryHandler(public_join_callback, pattern=r"^public_join:")
+        CallbackQueryHandler(report_callback, pattern=r"^report:")
     )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -223,6 +228,9 @@ async def main():
     for handler in handlers:
         application.add_handler(handler)
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    application.add_handler(
+        MessageHandler(filters.PHOTO, handle_help_system_photo)
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )

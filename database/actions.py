@@ -55,6 +55,25 @@ class ButtonCommand(CreateDB):
             row = await conn.fetchrow("SELECT * FROM rooms WHERE id = $1", room_id)
             return dict(row) if row else None
 
+    async def get_report_users(self) -> Optional[dict]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM user_reports")
+            return dict(row) if row else None
+
+    async def result_report(self) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM user_reports ORDER BY updated_at DESC"
+            )
+            return [dict(row) for row in rows]
+
+    async def delete_user_report(self, user_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM user_reports WHERE user_id = $1",
+                user_id,
+            )
+        
     async def update_room_game_state(
         self, room_id: str, word: str, spy_id: int, card_url: str = None
     ):
@@ -208,6 +227,22 @@ class ButtonCommand(CreateDB):
                 return True
             except:
                 return False
+            
+    async def add_user_report(self,user_id : int,image_input,content : str)->None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_reports (user_id, content, files)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE
+                SET content = EXCLUDED.content,
+                    files = EXCLUDED.files,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                user_id,
+                content,
+                image_input,
+            )
 
     async def remove_player_from_room(self, user_id: int, room_id: str) -> None:
         async with self.pool.acquire() as conn:
