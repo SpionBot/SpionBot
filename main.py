@@ -218,6 +218,8 @@ async def main():
     )
     application.add_handler(
         CallbackQueryHandler(public_join_callback, pattern=r"^public_join:")
+    )
+    application.add_handler(
         CallbackQueryHandler(report_callback, pattern=r"^report:")
     )
     application.add_handler(CommandHandler("donate", donate))
