@@ -121,10 +121,16 @@ async def back_to_room_callback(update: Update, context: ContextTypes.DEFAULT_TY
     reply_keyboard = get_inline_keyboard(source)
     players = await db.get_room_players(room_id)
     spy_count = room.get("spy_count", 1)
+    is_public = room.get("is_public", False)
+    mode = room.get("mode", DEFAULT_MODE)
     call_text = {
-        'join_game':get_join_room_text(room_id,len(players),get_theme_name(DEFAULT_MODE), spy_count=spy_count),
-        'start_game':get_message_start(room_id, len(players), get_theme_name(DEFAULT_MODE), spy_count=spy_count),
-        'restart_game':get_restart_room_text(room_id, players, room),
+        'join_game': get_join_room_text(
+            is_public, room_id, len(players), get_theme_name(mode), spy_count=spy_count
+        ),
+        'start_game': get_message_start(
+            is_public, room_id, len(players), get_theme_name(mode), spy_count=spy_count
+        ),
+        'restart_game': get_restart_room_text(is_public, room_id, players, room),
     }
     await query.message.edit_text(
         text=call_text[source],

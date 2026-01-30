@@ -63,9 +63,16 @@ class ButtonCommand(CreateDB):
     async def result_report(self) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM user_reports ORDER BY updated_at DESC"
+                "SELECT * FROM user_reports ORDER BY created_at DESC, id DESC"
             )
             return [dict(row) for row in rows]
+
+    async def delete_report(self, report_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM user_reports WHERE id = $1",
+                report_id,
+            )
 
     async def delete_user_report(self, user_id: int) -> None:
         async with self.pool.acquire() as conn:
@@ -75,19 +82,29 @@ class ButtonCommand(CreateDB):
             )
         
     async def update_room_game_state(
-        self, room_id: str, word: str, spy_id: int, card_url: str = None
+        self,
+        room_id: str,
+        word: str,
+        spy_id: int,
+        card_url: str = None,
+        initial_player_count: Optional[int] = None,
     ):
+        if not isinstance(initial_player_count, int) or initial_player_count < 0:
+            initial_player_count = None
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE rooms 
-                SET word = $1, spy_id = $2, card_url = $3, 
+                SET word = $1, spy_id = $2, card_url = $3,
+                    initial_player_count = $4,
+                    non_spy_kicks = 0,
                     game_started = TRUE, updated_at = CURRENT_TIMESTAMP
-                WHERE id = $4
+                WHERE id = $5
             """,
                 word,
                 spy_id,
                 card_url,
+                initial_player_count,
                 room_id,
             )
 
@@ -97,6 +114,9 @@ class ButtonCommand(CreateDB):
                 """
                 UPDATE rooms 
                 SET word = NULL, spy_id = NULL, card_url = NULL,
+                    spectators = '{}'::BIGINT[],
+                    initial_player_count = NULL,
+                    non_spy_kicks = 0,
                     game_started = FALSE, updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1
             """,
@@ -152,6 +172,66 @@ class ButtonCommand(CreateDB):
                 bool(is_public),
                 room_id,
             )
+
+    async def update_room_non_spy_kicks(self, room_id: str, non_spy_kicks: int) -> None:
+        if not isinstance(non_spy_kicks, int) or non_spy_kicks < 0:
+            non_spy_kicks = 0
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET non_spy_kicks = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                non_spy_kicks,
+                room_id,
+            )
+
+
+    async def add_room_spectator(self, room_id: str, user_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET spectators = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT unnest(
+                            COALESCE(spectators, '{}'::BIGINT[]) || $1::BIGINT
+                        )
+                    )
+                ),
+                updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                user_id,
+                room_id,
+            )
+
+    async def remove_room_spectator(self, room_id: str, user_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET spectators = array_remove(COALESCE(spectators, '{}'::BIGINT[]), $1::BIGINT),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                user_id,
+                room_id,
+            )
+
+    async def clear_room_spectators(self, room_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET spectators = '{}'::BIGINT[],
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                room_id,
+            )
+
 
     async def get_public_rooms(self, limit: int = 10, offset: int = 0) -> List[dict]:
         if limit < 1:
@@ -234,10 +314,6 @@ class ButtonCommand(CreateDB):
                 """
                 INSERT INTO user_reports (user_id, content, files)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (user_id) DO UPDATE
-                SET content = EXCLUDED.content,
-                    files = EXCLUDED.files,
-                    updated_at = CURRENT_TIMESTAMP
                 """,
                 user_id,
                 content,
@@ -251,12 +327,31 @@ class ButtonCommand(CreateDB):
                 user_id,
                 room_id,
             )
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET spectators = array_remove(COALESCE(spectators, '{}'::BIGINT[]), $1::BIGINT),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                """,
+                user_id,
+                room_id,
+            )
 
     async def remove_player_from_all_rooms(self, user_id: int) -> None:
         """Полностью очищает пользователя из всех комнат (на случай рассинхронов)."""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM players WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                """
+                UPDATE rooms
+                SET spectators = array_remove(COALESCE(spectators, '{}'::BIGINT[]), $1::BIGINT),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE $1 = ANY(COALESCE(spectators, '{}'::BIGINT[]))
+                """,
                 user_id,
             )
 

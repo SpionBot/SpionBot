@@ -29,20 +29,40 @@ def get_admin_panel_keyboard() -> ReplyKeyboardMarkup:
 
 
 def get_room_keyboard(admin : bool = False,is_public: bool = False) -> ReplyKeyboardMarkup:
-    toggle_label = (
-        "🔒 Закрыть комнату" if is_public else "🌐 Открыть комнату"
-    )
+    toggle_label = ["🔒 Закрыть комнату"] if is_public else ["🌐 Открыть комнату"]
+    toggle_label.append("🗳️ Голосование")
+    admin_func = ["▶️ Начать игру", "🔄 Перезапустить"]
     keyboard = [
-            ["▶️ Начать игру", "🔄 Перезапустить"],
             ["🚪 Выйти из комнаты", "🏠 Главное меню"],
     ]
     if admin:
-        keyboard.append([toggle_label])
+        keyboard.append(admin_func)
+        keyboard.append(toggle_label)
+
     return ReplyKeyboardMarkup(
         keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+def build_vote_keyboard(players: list[tuple[int, str]], room_id: str, row_size: int = 2) -> InlineKeyboardMarkup:
+    if row_size < 1:
+        row_size = 1
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(players), row_size):
+        row: list[InlineKeyboardButton] = []
+        for player_id, name in players[i : i + row_size]:
+            label = name or "Игрок"
+            if len(label) > 24:
+                label = label[:23] + "…"
+            row.append(
+                InlineKeyboardButton(
+                    text=label, callback_data=f"vote:{room_id}:{player_id}"
+                )
+            )
+        if row:
+            rows.append(row)
+    return InlineKeyboardMarkup(rows)
 def get_game_inline_button(easy: int, medium: int, hard: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -83,7 +103,7 @@ def get_message_start(status : bool,room_id: str, players: int, mode: str, spy_c
         f"Отправьте этот ID другим игрокам\n\n"
         f"👥 Игроков: {str(players)}/15\n"
         f"🎴 Режим: {mode}\n"
-        f"ℹ️ Статус комнаты:{status_room}\n"
+        f"ℹ️ Статус комнаты: {status_room}\n"
         f"🕵️ Шпионов: {spy_count}\n"
         f"🕵️ Сменить: /spies &lt;число&gt;\n"
         f"⬇️ Выберите режим через кнопки снизу\n"
@@ -214,7 +234,7 @@ def get_keyboard_report() -> ReplyKeyboardMarkup:
     )
 
 def get_report_inline_keyboard(
-    index: int, total: int, report_user_id: int
+    index: int, total: int, report_user_id: int, report_id: int
 ) -> InlineKeyboardMarkup:
     if total > 1:
         prev_index = (index - 1) % total
@@ -232,7 +252,7 @@ def get_report_inline_keyboard(
             nav_row,
             [
                 InlineKeyboardButton(
-                    "🗑️ Удалить", callback_data=f"report:delete:{report_user_id}:{index}"
+                    "🗑️ Удалить", callback_data=f"report:delete:{report_id}:{index}"
                 )
             ],
             [
