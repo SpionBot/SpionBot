@@ -6,7 +6,7 @@ from dataclasses import dataclass,field
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 from telegram import (
     InlineKeyboardButton,
@@ -44,6 +44,7 @@ from handlers.button import (
     _build_hint_selection_keyboard,
     _personal_account_text,
     _build_donate_keyboard,
+    build_vote_keyboard,
 
 )
 from utils.decorators import (
@@ -93,6 +94,24 @@ class SingleModeSession:
     time: datetime = field(default_factory=lambda: datetime.now(TZ_MSK_PLUS_4))
 
 SINGLE_MODE_SESSIONS: Dict[int, SingleModeSession] = {}
+VOTE_DURATION_SECONDS = 30
+
+@dataclass
+class VoteSession:
+    room_id: str
+    creator_id: int
+    players: List[int]
+    candidates: List[int]
+    player_labels: Dict[int, str]
+    votes: Dict[int, int] = field(default_factory=dict)
+    started_at: float = 0.0
+    ends_at: float = 0.0
+    message_refs: List[Tuple[int, int]] = field(default_factory=list)
+    ended: bool = False
+    winner_id: Optional[int] = None
+    tie: bool = False
+    end_task: Optional[asyncio.Task] = None
+VOTE_SESSIONS: Dict[str, VoteSession] = {}
 
 MAX_ROOM_CHAT_LEN = 800
 PUBLIC_ROOMS_PAGE_SIZE = 5
@@ -135,7 +154,8 @@ def _build_report_text(
 ) -> str:
     user_id = report.get("user_id", "—")
     content = report.get("content") or ""
-    time_text = _format_report_time(report.get("updated_at"))
+    time_value = report.get("created_at") or report.get("updated_at")
+    time_text = _format_report_time(time_value)
     header = f"<b>Жалоба {index + 1}/{total}</b>\n"
     meta = f"ID: <code>{user_id}</code>\n"
     if time_text:
@@ -147,6 +167,34 @@ def _build_report_text(
     body = _truncate_report_body(content, max(0, available))
     return base + body
 
+def _build_single_mode_keyboard(session: SingleModeSession) -> InlineKeyboardMarkup:
+    is_spy = session.current_index in session.spy_indices
+    if session.revealed and is_spy:
+        center_label = "Вы — шпион"
+    else:
+        center_label = session.word if session.revealed else "Карта скрыта"
+    reveal_label = "🔓 Скрыть карту" if session.revealed else "🃏 Открыть карту"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬅️", callback_data="single:prev"),
+                InlineKeyboardButton(center_label, callback_data="single:noop"),
+                InlineKeyboardButton("➡️", callback_data="single:next"),
+            ],
+            [
+                InlineKeyboardButton(reveal_label, callback_data="single:reveal"),
+                InlineKeyboardButton("🏠 Главное меню", callback_data="single:exit"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🕵️ Шпионов: {session.spy_count}", callback_data="single:spy_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton("🔁 Перезапустить", callback_data="single:restart")
+            ],
+        ]
+    )
 
 async def _send_report_message(
     chat_id: int,
@@ -156,7 +204,8 @@ async def _send_report_message(
     total: int,
 ):
     report_user_id = report.get("user_id")
-    keyboard = get_report_inline_keyboard(index, total, report_user_id)
+    report_id = report.get("id")
+    keyboard = get_report_inline_keyboard(index, total, report_user_id, report_id)
     file_bytes = _normalize_report_file(report)
     if file_bytes:
         caption = _build_report_text(
@@ -215,6 +264,42 @@ async def show_main_menu(
     )
 
 
+@decorators.rate_limit()
+@decorators.private_chat_only()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_subscribed(context.bot, user_id):
+        await update.message.reply_text(
+            "❗ Чтобы играть, подпишись на канал:",
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+    await show_main_menu(user_id, context)
+
+
+async def check_subscription_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if not query:
+        return
+    user_id = query.from_user.id
+    await query.answer()
+    if await is_subscribed(context.bot, user_id):
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await show_main_menu(user_id, context, notice="✅ Подписка подтверждена!")
+    else:
+        await query.answer(
+            "\u2757 \u041f\u043e\u0434\u043f\u0438\u0448\u0438\u0442\u0435\u0441\u044c \u043d\u0430 \u043a\u0430\u043d\u0430\u043b \u0438 \u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0441\u043d\u043e\u0432\u0430.", show_alert=True
+        )
+
+
 def _get_display_name(user):
     if not user:
         return "Игрок"
@@ -235,12 +320,599 @@ def _parse_referral_code(code: str) -> Optional[int]:
         return None
     return inviter_id
 
+async def _send_single_mode_card(
+    user_id: int, context: ContextTypes.DEFAULT_TYPE, session: SingleModeSession
+):
+    photo_source = _get_single_mode_photo(session)
+    try:
+        message = await context.bot.send_photo(
+            chat_id=user_id,
+            photo=photo_source,
+            caption=_build_single_mode_caption(session),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_single_mode_keyboard(session),
+        )
+    except BadRequest as exc:
+        logger.error("Single mode send failed: %s", exc)
+        return await context.bot.send_message(
+            chat_id=user_id,
+            text=_build_single_mode_caption(session),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_single_mode_keyboard(session),
+        )
+    if not session.back_card_file_id and hasattr(message, "photo") and message.photo:
+        session.back_card_file_id = message.photo[-1].file_id
+    if (
+        session.revealed
+        and session.current_index in session.spy_indices
+        and not session.spy_card_file_id
+        and hasattr(message, "photo")
+        and message.photo
+    ):
+        session.spy_card_file_id = message.photo[-1].file_id
+    return message
+
+def _create_single_mode_session(
+    player_count: int, mode: str, spy_count: int = 1
+) -> Optional[SingleModeSession]:
+    words, cards_map = get_words_and_cards_by_mode(mode)
+    if not words:
+        return None
+    if not isinstance(spy_count, int) or spy_count < 1:
+        spy_count = 1
+    max_spies = max(1, player_count - 1)
+    spy_count = min(spy_count, max_spies)
+    word = random.choice(words)
+    card_url = cards_map.get(word, "")
+    spy_indices = tuple(sorted(random.sample(range(player_count), k=spy_count)))
+    return SingleModeSession(
+        chat_id=0,
+        message_id=0,
+        word=word,
+        card_url=card_url,
+        player_count=player_count,
+        spy_count=spy_count,
+        spy_indices=spy_indices,
+        current_index=0,
+        mode=mode,
+    )
 
 def _get_user_display_for_chat(user) -> str:
     if not user:
         return "Игрок"
     return user.full_name or user.username or "Игрок"
 
+def _get_room_spectators(room: dict) -> set[int]:
+    if not room:
+        return set()
+    spectators = room.get("spectators") or []
+    if isinstance(spectators, (list, tuple)):
+        return {int(user_id) for user_id in spectators if user_id is not None}
+    return set()
+
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.room_lock()
+async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    current_room = await db.get_user_room(user_id)
+    if current_room:
+        await update.message.reply_text("❌ Вы уже в комнате. Используйте /leave, чтобы выйти.")
+        return
+
+    room_id = None
+    for _ in range(10):
+        candidate = str(random.randint(1000, 9999))
+        if await db.get_room(candidate) is None:
+            created = await db.create_room(
+                candidate,
+                user_id,
+                DEFAULT_MODE,
+                spy_count=1,
+                is_public=False,
+            )
+            if created:
+                room_id = candidate
+                break
+    if not room_id:
+        await update.message.reply_text("⚠️ Не удалось создать комнату. Попробуйте ещё раз.")
+        return
+
+    set_room_prob(user_id, room_id)
+
+    keyboard = get_room_mode_keyboard()
+    inline_keyboard = get_inline_keyboard("start_game")
+    await update.message.reply_text(
+        "✅ Комната создана!",
+        reply_markup=keyboard,
+    )
+    await update.message.reply_text(
+        text=get_message_start(False, room_id, 1, get_theme_name(DEFAULT_MODE), spy_count=1),
+        parse_mode=ParseMode.HTML,
+        reply_markup=inline_keyboard,
+    )
+    await update.message.reply_text(
+        "🕵️ Выберите количество шпионов:",
+        reply_markup=build_spy_count_keyboard(room_id),
+    )
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+async def _show_public_rooms(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1, edit_message: bool = False
+):
+    if page < 1:
+        page = 1
+    total = await db.get_public_rooms_count()
+    total_pages = max(1, math.ceil(total / PUBLIC_ROOMS_PAGE_SIZE))
+    if page > total_pages:
+        page = total_pages
+    rooms = await db.get_public_rooms(
+        limit=PUBLIC_ROOMS_PAGE_SIZE,
+        offset=(page - 1) * PUBLIC_ROOMS_PAGE_SIZE,
+    )
+
+    if not rooms:
+        text = (
+            "🔑 Введите ID <b>комнаты</b> к которой хотите присоединиться.\n"
+            "🕳️ Публичных <b>комнат</b> нет.\n"
+        )
+
+        markup = None
+    else:
+        lines_out = [
+            "🔑 Введите <b>ID комнаты</b> к которой хотите присоединиться.",
+            "🆓🚪 Публичные <b>комнаты</b>:",
+        ]
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        for room in rooms:
+            room_id = room["id"]
+            mode_name = get_theme_name(room.get("mode", DEFAULT_MODE))
+            player_count = room.get("player_count", 0)
+            lines_out.append(
+                f"• {room_id} | {mode_name} | {player_count}/15"
+            )
+            keyboard_rows.append(
+                [InlineKeyboardButton(f"Войти {room_id}", callback_data=f"public_join:{room_id}")]
+            )
+
+        if total_pages > 1:
+            nav_buttons: list[InlineKeyboardButton] = []
+            if page > 1:
+                nav_buttons.append(
+                    InlineKeyboardButton("<", callback_data=f"public_rooms:page:{page - 1}")
+                )
+            nav_buttons.append(
+                InlineKeyboardButton(f"{page}/{total_pages}", callback_data="public_rooms:noop")
+            )
+            if page < total_pages:
+                nav_buttons.append(
+                    InlineKeyboardButton(">", callback_data=f"public_rooms:page:{page + 1}")
+                )
+            keyboard_rows.append(nav_buttons)
+
+        text = "\n".join(lines_out)
+        markup = InlineKeyboardMarkup(keyboard_rows)
+
+    message = update.effective_message
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if edit_message and message:
+        try:
+            await message.edit_text(text=text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return
+        except Exception:
+            pass
+    if chat_id is not None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    args = context.args or []
+    message = update.message
+
+    if not args:
+        await _show_public_rooms(update, context, page=1, edit_message=False)
+        return
+
+    room_id = args[0].strip()
+    if not room_id.isdigit():
+        await message.reply_text("Некорректный ID комнаты.")
+        return
+
+    lock = room_locks.get_lock(room_id)
+    async with lock:
+        room = await db.get_room(room_id)
+        if not room:
+            await update.message.reply_text("❌ Комната не найдена!")
+            return
+        if room.get("game_started"):
+            await update.message.reply_text("❌ Игра уже началась!")
+            return
+        current_room = await db.get_user_room(user_id)
+        if current_room:
+            if current_room == room_id:
+                await update.message.reply_text("Вы уже в этой комнате!")
+            else:
+                await update.message.reply_text("Вы уже в другой комнате. Сначала выйдите из неё.")
+            return
+
+        success = await db.add_player_to_room(user_id, room_id)
+        if not success:
+            await update.message.reply_text("Не удалось присоединиться.")
+            return
+
+    players = await db.get_room_players(room_id)
+    spy_count = room.get("spy_count", 1)
+    add_user_room(user_id, room_id, len(players))
+
+    keyboard = get_room_keyboard(False, room.get("is_public", False))
+    inline_keyboard = get_inline_keyboard("join_game")
+    await update.message.reply_text(
+        f"✅ Вы присоединились к комнате {room_id}!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    await update.message.reply_text(
+        text=get_join_room_text(
+            room.get("is_public", False),
+            room_id,
+            len(players),
+            get_theme_name(DEFAULT_MODE),
+            spy_count=spy_count,
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=inline_keyboard,
+    )
+
+    creator_id = room.get("creator_id")
+    if creator_id:
+        try:
+            await context.bot.send_message(
+                creator_id,
+                f"К вам присоединился игрок! Всего игроков: {len(players)}",
+            )
+        except Exception:
+            pass
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_public(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Вы не в комнате.")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена.")
+        return
+    if room.get("is_public"):
+        await update.message.reply_text("Комната уже публичная.")
+        return
+    await db.update_room_public(room_id, True)
+    await update.message.reply_text(
+        "Комната стала публичной. Другие могут присоединиться через /join.",
+        reply_markup=get_room_keyboard(True, True),
+    )
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+@decorators.creator_only()
+async def make_room_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Вы не в комнате.")
+        return
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена.")
+        return
+    if not room.get("is_public"):
+        await update.message.reply_text("Комната уже приватная.")
+        return
+    await db.update_room_public(room_id, False)
+    await update.message.reply_text(
+        "Комната стала приватной. Войти можно только по ID.",
+        reply_markup=get_room_keyboard(True, False),
+    )
+
+
+@decorators.game_not_started()
+@subscription_required
+@decorators.rate_limit()
+@decorators.creator_only()
+@decorators.room_lock()
+async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    logger.info(f"USER {user_id} requested start game")
+
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        logger.info(f"USER {user_id} not in room")
+        await update.message.reply_text("❌ Вы не в комнате!")
+        return
+
+    room = await db.get_room(room_id)
+    if not room:
+        logger.info(f"Room {room_id} not found")
+        await update.message.reply_text("❌ Комната не найдена!")
+        return
+
+    players = await db.get_room_players(room_id)
+    spectators = _get_room_spectators(room)
+    active_players = [player_id for player_id in players if player_id not in spectators]
+    logger.info(f"Players in room {room_id}: {players}")
+    if len(active_players) < 2:
+        await update.message.reply_text("❌ Нужно минимум 2 активных игрока для старта.")
+        return
+
+    mode = room.get("mode", DEFAULT_MODE)
+    words, cards_map = get_words_and_cards_by_mode(mode)
+    word = random.choice(words)
+    card_url = cards_map.get(word, "")
+
+    requested_spy_count = room.get("spy_count", 1) or 1
+    if not isinstance(requested_spy_count, int):
+        requested_spy_count = 1
+    max_spies = max(1, len(active_players) - 1)
+    spy_count = min(max(1, requested_spy_count), max_spies)
+    if spy_count != requested_spy_count:
+        await update.message.reply_text(
+            f"🕵️ Количество шпионов скорректировано до {spy_count} (активных игроков: {len(active_players)})."
+        )
+        await db.update_room_spy_count(room_id, spy_count)
+    spies = set(random.sample(active_players, k=spy_count))
+    primary_spy = next(iter(spies))
+
+    await db.update_room_game_state(
+        room_id,
+        word,
+        primary_spy,
+        card_url,
+        initial_player_count=len(active_players),
+    )
+
+    for player_id in active_players:
+        if player_id in spies:
+            await db.update_player_role(player_id, room_id, "шпион")
+            await db.update_stat_game_vil(player_id)
+            account = await db.get_user_account(player_id)
+            if not account:
+                easy = medium = hard = 0
+            else:
+                easy = account["easy_hints"]
+                medium = account["medium_hints"]
+                hard = account["hard_hints"]
+            keyboard_inline = get_game_inline_button(easy, medium, hard)
+
+            cached_file_id = await db.get_cached_image(SPY_CARD_CACHE_KEY)
+            caption = (
+                "🎭 Вы - ШПИОН!\n\n"
+                "❌ Вы не знаете слово.\n"
+                f"👥 Игроков: {len(active_players)}\n"
+                f"🎯 Режим: {get_theme_name(mode)}"
+            )
+            try:
+                if cached_file_id:
+                    await context.bot.send_photo(
+                        chat_id=player_id,
+                        photo=cached_file_id,
+                        caption=caption,
+                        reply_markup=keyboard_inline,
+                    )
+                elif SPY_CARD_BYTES:
+                    result = await context.bot.send_photo(
+                        chat_id=player_id,
+                        photo=InputFile(
+                            BytesIO(SPY_CARD_BYTES), filename=SPY_CARD_PATH.name
+                        ),
+                        caption=caption,
+                        reply_markup=keyboard_inline,
+                    )
+                    if hasattr(result, "photo") and result.photo:
+                        await db.cache_image(
+                            SPY_CARD_CACHE_KEY,
+                            result.photo[-1].file_id,
+                            mode,
+                        )
+                else:
+                    await context.bot.send_photo(
+                        chat_id=player_id,
+                        photo=SINGLE_MODE_SPY_IMAGE_URL,
+                        caption=caption,
+                        reply_markup=keyboard_inline,
+                    )
+            except Exception as e:
+                logger.error(f"Error sending spy photo: {e}")
+                await context.bot.send_message(
+                    player_id,
+                    caption,
+                    reply_markup=keyboard_inline,
+                )
+
+        else:
+            await db.update_player_role(player_id, room_id, "мирный", word, card_url)
+            await db.update_stat_game(player_id)
+            caption_html = (
+                "✅ Вы - мирный игрок!\n\n"
+                f"🎴 Загаданная карта: <b>{word}</b>\n"
+                f"👥 Игроков: {len(active_players)}\n"
+                f"🕵️ Шпионов: {spy_count}"
+            )
+            if card_url:
+                cached_file_id = await db.get_cached_image(card_url)
+                try:
+                    if cached_file_id:
+                        await context.bot.send_photo(
+                            chat_id=player_id,
+                            photo=cached_file_id,
+                            caption=caption_html,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        result = await context.bot.send_photo(
+                            chat_id=player_id,
+                            photo=card_url,
+                            caption=caption_html,
+                            parse_mode=ParseMode.HTML,
+                        )
+                        if hasattr(result, "photo") and result.photo:
+                            await db.cache_image(
+                                card_url, result.photo[-1].file_id, mode
+                            )
+                except Exception as e:
+                    logger.error(f"Error sending card photo: {e}")
+                    await context.bot.send_message(
+                        player_id,
+                        caption_html,
+                        parse_mode=ParseMode.HTML,
+                    )
+            else:
+                await context.bot.send_message(
+                    player_id,
+                    caption_html,
+                    parse_mode=ParseMode.HTML,
+                )
+
+
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.creator_only()
+@decorators.game_not_started()
+@decorators.room_lock()
+async def set_spies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Вы не в комнате!")
+        return
+
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена!")
+        return
+
+    players = await db.get_room_players(room_id)
+    spectators = _get_room_spectators(room)
+    active_players = [player_id for player_id in players if player_id not in spectators]
+    current = room.get("spy_count", 1) or 1
+    max_spies = max(1, len(active_players) - 1)
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Текущее количество шпионов: {current}\n"
+            f"Активных игроков: {len(active_players)}\n"
+            "Использование: /spies <число>\n"
+            f"Допустимый диапазон: 1-{max_spies}"
+        )
+        return
+
+    try:
+        requested = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Использование: /spies <число>")
+        return
+
+    if requested < 1:
+        requested = 1
+    if requested > max_spies:
+        requested = max_spies
+
+    await db.update_room_spy_count(room_id, requested)
+    await update.message.reply_text(
+        f"Количество шпионов установлено: {requested}\n"
+        "Чтобы изменить снова: /spies <число>"
+    )
+
+def _build_single_mode_selection_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(SINGLE_MODE_PLAYER_OPTIONS), 3):
+        buttons = [
+            InlineKeyboardButton(
+                f"{count} игроков", callback_data=f"single:select:{count}"
+            )
+            for count in SINGLE_MODE_PLAYER_OPTIONS[i : i + 3]
+        ]
+        rows.append(buttons)
+    rows.append(
+        [InlineKeyboardButton("❌ Отмена", callback_data="single:cancel")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.creator_only()
+@decorators.room_lock()
+async def restart_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    room_id = await db.get_user_room(user_id)
+    if not room_id:
+        await update.message.reply_text("❌ Вы не в комнате!")
+        return
+
+    room = await db.get_room(room_id)
+    if not room:
+        await update.message.reply_text("❌ Комната не найдена!")
+        return
+
+    await db.reset_room_game(room_id)
+    players = await db.get_room_players(room_id)
+    inline_keyboard = get_inline_keyboard("restart_game")
+    status = await db.get_room(room_id)
+    if room["creator_id"] == user_id:
+        keyboard = get_room_keyboard(False,room["is_public"])
+    else:
+        keyboard = get_room_keyboard(True,room["is_public"])
+    await update.message.reply_text(
+        get_restart_room_text(status["is_public"], room_id, players, room),
+        parse_mode=ParseMode.HTML,
+        reply_markup=inline_keyboard,
+    )
+
+    for player_id in players:
+        if player_id != user_id:
+            try:
+                await context.bot.send_message(
+                    player_id,
+                    "🔄 Игра перезапущена. Нажмите Начать игру для новой партии.",
+                    reply_markup=keyboard
+                )
+            except Exception:
+                pass
+
+
+@subscription_required
+@decorators.rate_limit()
+@decorators.private_chat_only()
+async def single_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = _build_single_mode_selection_keyboard()
+    await update.message.reply_text(
+        "🎮 Выберите количество игроков:",
+        reply_markup=keyboard,
+    )
 
 async def _broadcast_room_chat(
     room_id: str,
@@ -314,95 +986,43 @@ async def _broadcast_room_voice(
                 )
             except Exception:
                 continue
-
-
-async def _handle_referral_start(
-    user_id: int,
-    code: str,
-    friend_name: str,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> Optional[str]:
-    inviter_id = _parse_referral_code(code)
-    if not inviter_id or inviter_id == user_id:
-        return None
-
-    existing_inviter = await db.get_referrer(user_id)
-    if existing_inviter:
-        return None
-
-    created = await db.create_referral(user_id, inviter_id)
-    if not created:
-        return None
-
-    inviter_balance = await db.add_balance(inviter_id, 2)
-    friend_balance = await db.add_balance(user_id, 1)
-
-    friend_display = friend_name or "Друг"
-
-    inviter_message = (
-        f"🎉 {friend_display} присоединился по вашей реферальной ссылке и вы получили 2⭐!"
-    )
-    if inviter_balance is not None:
-        inviter_message += f"\n⭐ Баланс: {inviter_balance}⭐"
-
-    try:
-        await context.bot.send_message(inviter_id, inviter_message)
-    except Exception:
-        pass
-
-    friend_message = "🎉 Вы получили 1⭐ за регистрацию по реферальной ссылке!"
-    if friend_balance is not None:
-        friend_message += f"\n⭐ Баланс: {friend_balance}⭐"
-    return friend_message
-
-
-def _build_single_mode_selection_keyboard() -> InlineKeyboardMarkup:
+def _build_single_mode_spy_selection_keyboard(
+    player_count: int, callback_prefix: str, include_back: bool
+) -> InlineKeyboardMarkup:
+    max_spies = max(1, player_count - 1)
+    options = list(range(1, min(5, max_spies) + 1))
     rows = []
-    for i in range(0, len(SINGLE_MODE_PLAYER_OPTIONS), 3):
-        buttons = [
-            InlineKeyboardButton(
-                f"{count} игроков", callback_data=f"single:select:{count}"
-            )
-            for count in SINGLE_MODE_PLAYER_OPTIONS[i : i + 3]
-        ]
-        rows.append(buttons)
-    rows.append(
-        [InlineKeyboardButton("❌ Отмена", callback_data="single:cancel")]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
-
-def _build_single_mode_keyboard(session: SingleModeSession) -> InlineKeyboardMarkup:
-    is_spy = session.current_index in session.spy_indices
-    if session.revealed and is_spy:
-        center_label = "Вы — шпион"
-    else:
-        center_label = session.word if session.revealed else "Карта скрыта"
-    reveal_label = "🔓 Скрыть карту" if session.revealed else "🃏 Открыть карту"
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("⬅️", callback_data="single:prev"),
-                InlineKeyboardButton(center_label, callback_data="single:noop"),
-                InlineKeyboardButton("➡️", callback_data="single:next"),
-            ],
-            [
-                InlineKeyboardButton(reveal_label, callback_data="single:reveal"),
-                InlineKeyboardButton("🏠 Главное меню", callback_data="single:exit"),
-            ],
+    for i in range(0, len(options), 3):
+        rows.append(
             [
                 InlineKeyboardButton(
-                    f"🕵️ Шпионов: {session.spy_count}", callback_data="single:spy_menu"
+                    f"{count} шпион" if count == 1 else f"{count} шпиона",
+                    callback_data=f"{callback_prefix}{count}",
                 )
-            ],
-            [
-                InlineKeyboardButton("🔁 Перезапустить", callback_data="single:restart")
-            ],
-        ]
-    )
+                for count in options[i : i + 3]
+            ]
+        )
+    if include_back:
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="single:back")])
+    else:
+        rows.append([InlineKeyboardButton("❌ Отмена", callback_data="single:cancel")])
+    return InlineKeyboardMarkup(rows)
 
-
+def _get_single_mode_photo(session: SingleModeSession):
+    is_spy = session.current_index in session.spy_indices
+    if session.revealed:
+        if is_spy:
+            if session.spy_card_file_id:
+                return session.spy_card_file_id
+            if SPY_CARD_BYTES:
+                return InputFile(BytesIO(SPY_CARD_BYTES), filename=SPY_CARD_PATH.name)
+            return SINGLE_MODE_SPY_IMAGE_URL
+        return session.card_url or SINGLE_MODE_PLACEHOLDER_URL
+    if session.back_card_file_id:
+        return session.back_card_file_id
+    if BACK_CARD_BYTES:
+        return InputFile(BytesIO(BACK_CARD_BYTES), filename=BACK_CARD_PATH.name)
+    return SINGLE_MODE_PLACEHOLDER_URL
 def _build_single_mode_caption(session: SingleModeSession) -> str:
     is_spy = session.current_index in session.spy_indices
     if not session.revealed:
@@ -428,106 +1048,6 @@ def _build_single_mode_caption(session: SingleModeSession) -> str:
         f"⚠️ Все остальные тоже видят это слово."
         f"\nИгрок {session.current_index + 1}/{session.player_count}"
     )
-
-
-def _create_single_mode_session(
-    player_count: int, mode: str, spy_count: int = 1
-) -> Optional[SingleModeSession]:
-    words, cards_map = get_words_and_cards_by_mode(mode)
-    if not words:
-        return None
-    if not isinstance(spy_count, int) or spy_count < 1:
-        spy_count = 1
-    max_spies = max(1, player_count - 1)
-    spy_count = min(spy_count, max_spies)
-    word = random.choice(words)
-    card_url = cards_map.get(word, "")
-    spy_indices = tuple(sorted(random.sample(range(player_count), k=spy_count)))
-    return SingleModeSession(
-        chat_id=0,
-        message_id=0,
-        word=word,
-        card_url=card_url,
-        player_count=player_count,
-        spy_count=spy_count,
-        spy_indices=spy_indices,
-        current_index=0,
-        mode=mode,
-    )
-
-
-def _build_single_mode_spy_selection_keyboard(
-    player_count: int, callback_prefix: str, include_back: bool
-) -> InlineKeyboardMarkup:
-    max_spies = max(1, player_count - 1)
-    options = list(range(1, min(5, max_spies) + 1))
-    rows = []
-    for i in range(0, len(options), 3):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{count} шпион" if count == 1 else f"{count} шпиона",
-                    callback_data=f"{callback_prefix}{count}",
-                )
-                for count in options[i : i + 3]
-            ]
-        )
-    if include_back:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="single:back")])
-    else:
-        rows.append([InlineKeyboardButton("❌ Отмена", callback_data="single:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _get_single_mode_photo(session: SingleModeSession):
-    is_spy = session.current_index in session.spy_indices
-    if session.revealed:
-        if is_spy:
-            if session.spy_card_file_id:
-                return session.spy_card_file_id
-            if SPY_CARD_BYTES:
-                return InputFile(BytesIO(SPY_CARD_BYTES), filename=SPY_CARD_PATH.name)
-            return SINGLE_MODE_SPY_IMAGE_URL
-        return session.card_url or SINGLE_MODE_PLACEHOLDER_URL
-    if session.back_card_file_id:
-        return session.back_card_file_id
-    if BACK_CARD_BYTES:
-        return InputFile(BytesIO(BACK_CARD_BYTES), filename=BACK_CARD_PATH.name)
-    return SINGLE_MODE_PLACEHOLDER_URL
-
-
-async def _send_single_mode_card(
-    user_id: int, context: ContextTypes.DEFAULT_TYPE, session: SingleModeSession
-):
-    photo_source = _get_single_mode_photo(session)
-    try:
-        message = await context.bot.send_photo(
-            chat_id=user_id,
-            photo=photo_source,
-            caption=_build_single_mode_caption(session),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_build_single_mode_keyboard(session),
-        )
-    except BadRequest as exc:
-        logger.error("Single mode send failed: %s", exc)
-        return await context.bot.send_message(
-            chat_id=user_id,
-            text=_build_single_mode_caption(session),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_build_single_mode_keyboard(session),
-        )
-    if not session.back_card_file_id and hasattr(message, "photo") and message.photo:
-        session.back_card_file_id = message.photo[-1].file_id
-    if (
-        session.revealed
-        and session.current_index in session.spy_indices
-        and not session.spy_card_file_id
-        and hasattr(message, "photo")
-        and message.photo
-    ):
-        session.spy_card_file_id = message.photo[-1].file_id
-    return message
-
 
 async def _update_single_mode_message(
     query, session: SingleModeSession
@@ -559,636 +1079,390 @@ async def _update_single_mode_message(
             logger.warning("Не удалось обновить Single Mode: %s", exc)
 
 
-async def check_subscription_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    query = update.callback_query
-    user_id = query.from_user.id
-    await query.answer()
-    if await is_subscribed(context.bot, user_id):
-        await query.message.delete()
-        await show_main_menu(user_id, context)
+def _build_vote_prompt_text(duration_seconds: int) -> str:
+    return (
+        "🗳️ Голосование!\n\n"
+        "Выберите игрока, за которого голосуете.\n"
+        "Голосование анонимное, можно переголосовать — учтётся последний выбор.\n"
+        f"⏳ Время: {duration_seconds} секунд."
+    )
+
+def _format_vote_results(session: VoteSession) -> str:
+    counts = {player_id: 0 for player_id in session.candidates}
+    for target_id in session.votes.values():
+        if target_id in counts:
+            counts[target_id] += 1
+    total_voters = len(session.candidates)
+    lines = [
+        "🗳️ Голосование завершено!",
+        f"Всего голосов: {len(session.votes)}/{total_voters}",
+        "",
+    ]
+    if not session.candidates:
+        lines.append("Нет доступных игроков для голосования.")
+        return "\n".join(lines)
+    for player_id in session.candidates:
+        label = session.player_labels.get(player_id, "Игрок")
+        lines.append(f"• {label}: {counts.get(player_id, 0)}")
+    lines.append("")
+    if session.tie:
+        lines.append("Ничья — никакой игрок не будет исключён.")
+    elif session.winner_id:
+        winner_label = session.player_labels.get(session.winner_id, "Игрок")
+        lines.append(f"👀 Исключенные: {winner_label}")
     else:
-        new_text = "❌ Ты ещё не подписался на канал. Подпишись, чтобы продолжить:"
-        new_markup = subscribe_keyboard()
-        if query.message.text != new_text or query.message.reply_markup != new_markup:
-            try:
-                await query.message.edit_text(new_text, reply_markup=new_markup)
-            except BadRequest:
-                pass
+        lines.append("Спектатор не выбран.")
+    return "\n".join(lines)
 
+def _role_is_spy(role: Optional[str]) -> bool:
+    if not role or not isinstance(role, str):
+        return False
+    return "шпион" in role.casefold()
 
-@decorators.rate_limit()
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    referral_notice = None
-    message_text = (update.message.text or "").strip()
-    command = message_text.split()[0] if message_text else ""
-    if command.startswith("/start"):
-        args = context.args or []
-        if args:
-            friend_name = _get_display_name(update.effective_user)
-            referral_notice = await _handle_referral_start(
-                user_id, args[0], friend_name, context
-            )
-    if not await is_subscribed(context.bot, user_id):
-        if referral_notice:
-            await update.message.reply_text(referral_notice)
-        await update.message.reply_text(
-            "❗ Чтобы играть, подпишись на канал:", reply_markup=subscribe_keyboard()
-        )
-        return
-    await db.ensure_user_account(user_id)
-    await show_main_menu(user_id, context, notice=referral_notice)
+def _get_non_spy_kick_limit(initial_players: Optional[int]) -> Optional[int]:
+    if not isinstance(initial_players, int) or initial_players <= 0:
+        return None
+    if initial_players < 5:
+        return 1
+    if initial_players < 9:
+        return 2
+    if initial_players < 12:
+        return 3
+    if initial_players <= 15:
+        return 4
+    return 4
 
+async def _build_civilians_win_summary(room_id: str, room: dict, players: list[int]) -> str:
+    spectators = _get_room_spectators(room)
+    lines = [
+        "🏁 Итог игры: мирные победили — все шпионы изгнаны.",
+        "",
+        "👥 Роли игроков:",
+    ]
+    for index, player_id in enumerate(players, start=1):
+        player_data = await db.get_player_data(player_id, room_id)
+        if player_data and player_data.get("role"):
+            role_label = player_data.get("role")
+        elif player_id in spectators:
+            role_label = "спектатор"
+        else:
+            role_label = "неизвестно"
+        lines.append(f"• Игрок {index}: {role_label}")
+    if room.get("word"):
+        lines.append("")
+        lines.append(f"🎴 Загаданное слово: {room['word']}")
+    return "\n".join(lines)
 
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-async def single_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    SINGLE_MODE_SESSIONS.pop(user_id, None)
-    keyboard = _build_single_mode_selection_keyboard()
-    await update.message.reply_text(
-        "🃏 Выберите количество игроков",
-        reply_markup=keyboard,
-    )
+async def _build_spy_win_summary(
+    room_id: str,
+    room: dict,
+    players: list[int],
+    non_spy_kicks: Optional[int] = None,
+    kick_limit: Optional[int] = None,
+) -> str:
+    spectators = _get_room_spectators(room)
+    lines = ["🏁 Итог игры: шпионы победили."]
+    if non_spy_kicks is not None and kick_limit is not None:
+        lines.append(f"🚫 Киков мирных: {non_spy_kicks}/{kick_limit}")
+    lines.extend(["", "👥 Роли игроков:"])
+    for index, player_id in enumerate(players, start=1):
+        player_data = await db.get_player_data(player_id, room_id)
+        if player_data and player_data.get("role"):
+            role_label = player_data.get("role")
+        elif player_id in spectators:
+            role_label = "спектатор"
+        else:
+            role_label = "неизвестно"
+        lines.append(f"• Игрок {index}: {role_label}")
+    if room.get("word"):
+        lines.append("")
+        lines.append(f"🎴 Загаданное слово: {room['word']}")
+    return "\n".join(lines)
 
-
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-async def create_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    is_public = False
-    for _ in range(10):
-        room_id = str(random.randint(1000, 9999))
-        room = await db.get_room(room_id)
-        if not room:
-            break
-    else:
-        await update.message.reply_text(
-            "❌ Не удалось создать комнату. Попробуйте ещё раз."
-        )
-        return
-    success = await db.create_room(
-        room_id, user_id, DEFAULT_MODE, spy_count=1, is_public=is_public
-    )
-
-
-    if not success:
-        await update.message.reply_text("❌ Ошибка при создании комнаты.")
-
-        return
-
-    words, _ = get_words_and_cards_by_mode(DEFAULT_MODE)
-    
-    keyboard = get_room_mode_keyboard()
-    inline_keyboard = get_inline_keyboard('start_game')
-    await update.message.reply_text(
-        "✅ Комната создана!\n\n",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
-    await update.message.reply_text(
-        text=get_message_start(False,room_id, 1, get_theme_name(DEFAULT_MODE), spy_count=1),
-        parse_mode=ParseMode.HTML,
-        reply_markup=inline_keyboard,
-    )
-    await update.message.reply_text(
-        "🕵️ Выберите количество шпионов для комнаты:",
-        reply_markup=build_spy_count_keyboard(room_id),
-    )
-
-def _build_public_rooms_page(
-    rooms: list[dict],
-    page: int,
-    total_pages: int,
-) -> tuple[str, InlineKeyboardMarkup]:
-    lines = ["🚪 Открытые комнаты (нажмите, чтобы зайти):"]
-    keyboard_rows: list[list[InlineKeyboardButton]] = []
-    for room in rooms:
-        room_id = room["id"]
-        player_count = room.get("player_count", 0) or 0
-        mode = room.get("mode") or DEFAULT_MODE
-        
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{room_id} ({player_count}/15) {mode}" ,
-                    callback_data=f"public_join:{room_id}",
-                )
-            ]
-        )
-
-    if total_pages > 1:
-        lines.append(f"Страница {page}/{total_pages}")
-
-    lines.append("🔑 Чтобы зайти в закрытую комнату: /join <ID>.")
-
-    nav_buttons: list[InlineKeyboardButton] = []
-    if page > 1:
-        nav_buttons.append(
-            InlineKeyboardButton("⬅️", callback_data=f"public_rooms:page:{page - 1}")
-        )
-    if page < total_pages:
-        nav_buttons.append(
-            InlineKeyboardButton("➡️", callback_data=f"public_rooms:page:{page + 1}")
-        )
-    if nav_buttons:
-        keyboard_rows.append(nav_buttons)
-
-    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
-
-
-async def _show_public_rooms(
-    update: Update,
+async def _restart_room_after_vote(
+    room_id: str,
+    room: dict,
+    players: list[int],
     context: ContextTypes.DEFAULT_TYPE,
-    page: int = 1,
-    per_page: int = PUBLIC_ROOMS_PAGE_SIZE,
-    edit_message: bool = False,
 ) -> None:
-    chat_id = (
-        update.effective_chat.id if update.effective_chat else update.effective_user.id
-    )
-    message = update.effective_message
-    if page < 1:
-        page = 1
-    if per_page < 1:
-        per_page = PUBLIC_ROOMS_PAGE_SIZE
-
-    total_rooms = await db.get_public_rooms_count()
-    if total_rooms <= 0:
-        text = "🔑 Открытых комнат пока нет. Можно зайти по ID: /join <ID>."
-        if edit_message and message:
-            try:
-                await message.edit_text(text=text, reply_markup=None)
-            except BadRequest:
-                await context.bot.send_message(chat_id=chat_id, text=text)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        return
-
-    total_pages = max(1, math.ceil(total_rooms / per_page))
-    if page > total_pages:
-        page = total_pages
-
-    offset = (page - 1) * per_page
-    rooms = await db.get_public_rooms(limit=per_page, offset=offset)
-    if not rooms and page > 1:
-        page = max(1, total_pages - 1)
-        offset = (page - 1) * per_page
-        rooms = await db.get_public_rooms(limit=per_page, offset=offset)
-
-    text, markup = _build_public_rooms_page(rooms, page, total_pages)
-    if edit_message and message:
+    await db.reset_room_game(room_id)
+    inline_keyboard = get_inline_keyboard("restart_game")
+    creator_id = room.get("creator_id")
+    if creator_id in players:
         try:
-            await message.edit_text(text=text, reply_markup=markup)
-        except BadRequest:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-        return
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=markup,
-    )
-
-
-
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args or []
-    if (
-        len(args) == 0
-        and (not update.message or not update.message.text or not update.message.text.isdigit())
-    ):
-        await _show_public_rooms(update, context)
-        return
-
-    if update.message and update.message.text == "🔗 Присоединиться":
-        await update.message.reply_text("📝 Введите ID комнаты для присоединения:")
-
-        return
-
-    if len(args) == 0 and update.message and update.message.text != "🔗 Присоединиться":
-        if update.message.text and update.message.text.isdigit():
-            room_id = update.message.text
-
-        else:
-            await update.message.reply_text(
-                "❌ Использование: /join <ID_комнаты> или отправьте ID комнаты"
+            await context.bot.send_message(
+                chat_id=creator_id,
+                text=get_restart_room_text(room.get("is_public"), room_id, players, room),
+                parse_mode=ParseMode.HTML,
+                reply_markup=inline_keyboard,
             )
-
-            return
-
-    else:
-        room_id = args[0]
-
-    lock = room_locks.get_lock(room_id)
-
-    async with lock:
-        room = await db.get_room(room_id)
-
-        if not room:
-            await update.message.reply_text("❌ Комната не найдена!")
-
-            return
-
-        if room["game_started"]:
-            await update.message.reply_text("❌ Игра уже началась!")
-
-            return
-
-        current_room = await db.get_user_room(user_id)
-
-        if current_room:
-            if current_room == room_id:
-                await update.message.reply_text("❌ Вы уже в этой комнате!")
-
-                return
-
-            await update.message.reply_text(
-                "❌ Сначала выйдите из текущей комнаты, чтобы присоединиться к другой."
-            )
-
-            return
-
-        success = await db.add_player_to_room(user_id, room_id)
-
-        if not success:
-            await update.message.reply_text("❌ Комната переполнена!")
-
-            return
-
-    players = await db.get_room_players(room_id)
-    inline_keyboard = get_inline_keyboard('join_game') 
-
-    stat = await db.get_room(room_id)
-
-    status_room = stat['is_public']
-    keyboard = get_room_keyboard(False,status_room)
-    spy_count = room.get("spy_count", 1)
-    await update.message.reply_text(
-        text = f"✅ Вы присоединились к комнате {room_id}!\n\n",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard
-    )
-    await update.message.reply_text(
-        text = get_join_room_text(status_room,room_id,len(players),get_theme_name(DEFAULT_MODE), spy_count=spy_count),
-        parse_mode=ParseMode.HTML,
-        reply_markup=inline_keyboard,
-    )
-
-    creator_id = room["creator_id"]
-
-    try:
-        await context.bot.send_message(
-            creator_id, f"📢 Игрок присоединился! Теперь игроков: {len(players)}"
-        )
-
-    except:
-        pass
-
-
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-@decorators.creator_only()
-async def make_room_public(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    room_id = await db.get_user_room(user_id)
-    if not room_id:
-        await update.message.reply_text("❌ Комнаты не существует.")
-        return
-    room = await db.get_room(room_id)
-    if not room:
-        await update.message.reply_text("❌ Комната не найдена.")
-        return
-    if room.get("is_public"):
-        await update.message.reply_text("✅ Комната не видна игрокам.")
-        return
-    await db.update_room_public(room_id, True)
-    await update.message.reply_text(
-        "👥 Комната теперь общедоступна. Она появится в списке рассылки /join.",
-            reply_markup=get_room_keyboard(True,True)
-    )
-
-
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-@decorators.creator_only()
-async def make_room_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    room_id = await db.get_user_room(user_id)
-    if not room_id:
-        await update.message.reply_text("❌ Комнаты не существует")
-        return
-    room = await db.get_room(room_id)
-    if not room:
-        await update.message.reply_text("❌ Комната не найдена.")
-        return
-    if not room.get("is_public"):
-        await update.message.reply_text("✅ Комната не видна игрокам.")
-        return
-    await db.update_room_public(room_id, False)
-    await update.message.reply_text(
-        "👤 Комната теперь приватная. Она не будет отображаться в списке /join.",
-        reply_markup=get_room_keyboard(True,False)
-    )
-
-
-@decorators.game_not_started()
-@subscription_required
-@decorators.rate_limit()
-@decorators.creator_only()
-@decorators.room_lock()
-async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-
-    logger.info(f"🔄 USER {user_id} пытается начать игру")
-
-    room_id = await db.get_user_room(user_id)
-
-    if not room_id: 
-        logger.info(f"❌ USER {user_id} не в комнате")
-
-        await update.message.reply_text("❌ Вы не в комнате!")
-
-        return
-
-    logger.info(f"🔒 USER {user_id} получил блокировку комнаты {room_id}")
-
-    room = await db.get_room(room_id)
-
-    if not room:
-        logger.info(f"❌ Комната {room_id} не найдена в БД")
-
-        await update.message.reply_text("❌ Комната не найдена!")
-
-        return
-
-    players = await db.get_room_players(room_id)
-
-    logger.info(f"👥 Игроки в комнате {room_id}: {players}")
-
-    if len(players) < 2:
-        await update.message.reply_text("❌ Нужно минимум 2 игрока!")
-
-        return
-
-    mode = room.get("mode", DEFAULT_MODE)
-
-    words, cards_map = get_words_and_cards_by_mode(mode)
-
-    word = random.choice(words)
-
-    card_url = cards_map.get(word, "")
-
-    requested_spy_count = room.get("spy_count", 1) or 1
-    if not isinstance(requested_spy_count, int):
-        requested_spy_count = 1
-    max_spies = max(1, len(players) - 1)
-    spy_count = min(max(1, requested_spy_count), max_spies)
-    if spy_count != requested_spy_count:
-        await update.message.reply_text(
-            f"ℹ️ Кол-во шпионов скорректировано до {spy_count} (игроков: {len(players)})."
-        )
-        await db.update_room_spy_count(room_id, spy_count)
-    spies = set(random.sample(players, k=spy_count))
-    primary_spy = next(iter(spies))
-
-    await db.update_room_game_state(room_id, word, primary_spy, card_url)
-
-    spies_label = "шпион" if spy_count == 1 else "шпионы"
-
+        except Exception:
+            pass
     for player_id in players:
-        if player_id in spies:
-            await db.update_player_role(player_id, room_id, "шпион")
-            await db.update_stat_game_vil(player_id)
-            account = await db.get_user_account(player_id)
-            if not account:
-                easy = medium = hard = 0
-            else:
-                easy = account["easy_hints"]
-                medium = account["medium_hints"]
-                hard = account["hard_hints"]
-            keyboard_inline = get_game_inline_button(easy, medium, hard)
-
-            account = await db.get_user_account(player_id)
-            if not account:
-                easy = medium = hard = 0
-            else:
-                easy = account["easy_hints"]
-                medium = account["medium_hints"]
-                hard = account["hard_hints"]
-            keyboard_inline = get_game_inline_button(easy, medium, hard)
-
-            cached_file_id = await db.get_cached_image(SPY_CARD_CACHE_KEY)
-
-            try:
-                if cached_file_id:
-                    await context.bot.send_photo(
-                        chat_id=player_id,
-                        photo=cached_file_id,
-                        caption=f"🎭 Вы - ШПИОН!\n\n❌ Вы не знаете слово!\n🎯 Ваша задача - понять слово.\n👥 Игроков: {len(players)}\n\n💡 Подсказка: это объект из {get_theme_name(mode)}",
-                        reply_markup=keyboard_inline,
-                    )
-
-                elif SPY_CARD_BYTES:
-                    result = await context.bot.send_photo(
-                        chat_id=player_id,
-                        photo=InputFile(
-                            BytesIO(SPY_CARD_BYTES), filename=SPY_CARD_PATH.name
-                        ),
-                        caption=f"🎭 Вы - ШПИОН!\n\n❌ Вы не знаете слово!\n🎯 Ваша задача - понять слово.\n👥 Игроков: {len(players)}\n\n💡 Подсказка: это объект из {get_theme_name(mode)}",
-                        reply_markup=keyboard_inline,
-                    )
-
-                    if hasattr(result, "photo") and result.photo:
-                        await db.cache_image(
-                            SPY_CARD_CACHE_KEY,
-                            result.photo[-1].file_id,
-                            mode,
-                        )
-                else:
-                    await context.bot.send_photo(
-                        chat_id=player_id,
-                        photo=SINGLE_MODE_SPY_IMAGE_URL,
-                        caption=f"🎭 Вы - ШПИОН!\n\n❌ Вы не знаете слово!\n🎯 Ваша задача - понять слово.\n👥 Игроков: {len(players)}\n\n💡 Подсказка: это объект из {get_theme_name(mode)}",
-                        reply_markup=keyboard_inline,
-                    )
-
-            except Exception as e:
-                logger.error(f"Error sending spy photo: {e}")
-
-                await context.bot.send_message(
-                    player_id,
-                    f"🎭 Вы - ШПИОН!\n\n❌ Вы не знаете слово!\n🎯 Ваша задача - понять слово.\n👥 Игроков: {len(players)}",
-                    reply_markup=keyboard_inline,
-                )
-
-        else:
-            await db.update_player_role(player_id, room_id, "мирный", word, card_url)
-            await db.update_stat_game(player_id)
-            if card_url:
-                cached_file_id = await db.get_cached_image(card_url)
-
-                try:
-                    if cached_file_id:
-                        await context.bot.send_photo(
-                            chat_id=player_id,
-                            photo=cached_file_id,
-                            caption=f"✅ Вы - мирный игрок!\n\n🎴 Загаданная карта: <b>{word}</b>\n👥 Игроков: {len(players)}\n⚠️ Среди вас есть {spies_label}!",
-                            parse_mode=ParseMode.HTML,
-                        )
-
-                    else:
-                        result = await context.bot.send_photo(
-                            chat_id=player_id,
-                            photo=card_url,
-                            caption=f"✅ Вы - мирный игрок!\n\n🎴 Загаданная карта: <b>{word}</b>\n👥 Игроков: {len(players)}\n⚠️ Среди вас есть {spies_label}!",
-                            parse_mode=ParseMode.HTML,
-                        )
-
-                        if hasattr(result, "photo") and result.photo:
-                            await db.cache_image(
-                                card_url, result.photo[-1].file_id, mode
-                            )
-
-                except Exception as e:
-                    logger.error(f"Error sending card photo: {e}")
-
-                    await context.bot.send_message(
-                        player_id,
-                        f"✅ Вы - мирный игрок!\n\n🎴 Загаданная карта: <b>{word}</b>\n👥 Игроков: {len(players)}\n⚠️ Среди вас есть {spies_label}!",
-                        parse_mode=ParseMode.HTML,
-                    )
-
-            else:
-                await context.bot.send_message(
-                    player_id,
-                    f"✅ Вы - мирный игрок!\n\n🎴 Загаданная карта: <b>{word}</b>\n👥 Игроков: {len(players)}\n⚠️ Среди вас есть {spies_label}!",
-                    parse_mode=ParseMode.HTML,
-                )
-
-    for player_id in players:
+        if player_id == creator_id:
+            continue
+        keyboard = get_room_keyboard(False, room.get("is_public"))
         try:
             await context.bot.send_message(
                 player_id,
-                f"🎮 Игра началась!\n👥 Игроков: {len(players)}\n🕵️ Шпионов: {spy_count}\n🎴 Тема: {get_theme_name(mode)}\n\n💬 Можно начинать обсуждение!",
+                "🔄 Игра перезапущена. Нажмите Начать игру для новой партии.",
+                reply_markup=keyboard,
             )
+        except Exception:
+            continue
+async def _finalize_vote_session(session: VoteSession, context: ContextTypes.DEFAULT_TYPE):
+    if session.ended:
+        return
+    session.ended = True
+    for chat_id, message_id in session.message_refs:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            continue
 
-        except:
+    counts = {player_id: 0 for player_id in session.candidates}
+    for target_id in session.votes.values():
+        if target_id in counts:
+            counts[target_id] += 1
+    winner_id = None
+    tie = False
+    if counts:
+        max_votes = max(counts.values())
+        if max_votes > 0:
+            winners = [player_id for player_id, count in counts.items() if count == max_votes]
+            if len(winners) == 1:
+                winner_id = winners[0]
+            else:
+                tie = True
+    session.winner_id = winner_id
+    session.tie = tie
+    winner_role = None
+    if winner_id:
+        try:
+            await db.add_room_spectator(session.room_id, winner_id)
+        except Exception:
             pass
+        try:
+            winner_data = await db.get_player_data(winner_id, session.room_id)
+            winner_role = winner_data.get("role") if winner_data else None
+        except Exception:
+            winner_role = None
+    result_text = _format_vote_results(session)
+    for player_id in session.players:
+        try:
+            await context.bot.send_message(chat_id=player_id, text=result_text)
+        except Exception:
+            continue
+    if VOTE_SESSIONS.get(session.room_id) is session:
+        VOTE_SESSIONS.pop(session.room_id, None)
 
-
-@subscription_required
-@decorators.rate_limit()
-@decorators.creator_only()
-@decorators.game_not_started()
-@decorators.room_lock()
-async def set_spies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    room_id = await db.get_user_room(user_id)
-    if not room_id:
-        await update.message.reply_text("❌ Вы не в комнате!")
+    room = await db.get_room(session.room_id)
+    if not room or not room.get("game_started"):
         return
-
-    room = await db.get_room(room_id)
-    if not room:
-        await update.message.reply_text("❌ Комната не найдена!")
+    players = await db.get_room_players(session.room_id)
+    if not players:
         return
+    spectators = _get_room_spectators(room)
+    active_players = [player_id for player_id in players if player_id not in spectators]
 
-    players = await db.get_room_players(room_id)
-    current = room.get("spy_count", 1) or 1
-    max_spies = max(1, len(players) - 1)
+    roles: Dict[int, Optional[str]] = {}
+    for player_id in players:
+        try:
+            player_data = await db.get_player_data(player_id, session.room_id)
+            roles[player_id] = player_data.get("role") if player_data else None
+        except Exception:
+            roles[player_id] = None
 
-    if not context.args:
-        await update.message.reply_text(
-            f"🕵️ Сейчас шпионов: {current}\n"
-            f"🕹️ Игроков: {len(players)}\n"
-            f"✅ Установить: /spies <число>\n"
-            f"ℹ️ Допустимо сейчас: 1–{max_spies}"
+    if winner_id and winner_id in roles and not winner_role:
+        winner_role = roles[winner_id]
+
+    non_spy_kicks = room.get("non_spy_kicks", 0) or 0
+    if winner_id and winner_role is not None and not _role_is_spy(winner_role):
+        non_spy_kicks += 1
+        await db.update_room_non_spy_kicks(session.room_id, non_spy_kicks)
+
+    spy_ids = {player_id for player_id, role in roles.items() if _role_is_spy(role)}
+    active_spy_ids = [player_id for player_id in active_players if player_id in spy_ids]
+
+    if spy_ids and not active_spy_ids:
+        summary_text = await _build_civilians_win_summary(
+            session.room_id, room, players
+        )
+        for player_id in players:
+            try:
+                await context.bot.send_message(chat_id=player_id, text=summary_text)
+            except Exception:
+                continue
+        await _restart_room_after_vote(
+            session.room_id,
+            room,
+            players,
+            context,
         )
         return
 
-    try:
-        requested = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Использование: /spies <число>")
+    initial_players = room.get("initial_player_count") or len(players)
+    kick_limit = _get_non_spy_kick_limit(initial_players)
+    if kick_limit is not None and non_spy_kicks >= kick_limit:
+        summary_text = await _build_spy_win_summary(
+            session.room_id,
+            room,
+            players,
+            non_spy_kicks,
+            kick_limit,
+        )
+        for player_id in players:
+            try:
+                await context.bot.send_message(chat_id=player_id, text=summary_text)
+            except Exception:
+                continue
+        await _restart_room_after_vote(
+            session.room_id,
+            room,
+            players,
+            context,
+        )
         return
 
-    if requested < 1:
-        requested = 1
-    if requested > max_spies:
-        requested = max_spies
+async def _finish_vote_task(session: VoteSession, context: ContextTypes.DEFAULT_TYPE):
+    loop = asyncio.get_running_loop()
+    delay = max(0.0, session.ends_at - loop.time())
+    if delay:
+        await asyncio.sleep(delay)
+    if VOTE_SESSIONS.get(session.room_id) is not session:
+        return
+    await _finalize_vote_session(session, context)
 
-    await db.update_room_spy_count(room_id, requested)
-    await update.message.reply_text(
-        f"✅ Кол-во шпионов установлено: {requested}\n"
-        f"ℹ️ Для смены позже: /spies <число>"
-    )
-
+async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    _, room_id, target_raw = parts
+    try:
+        target_id = int(target_raw)
+    except ValueError:
+        await query.answer("Неверный выбор.", show_alert=True)
+        return
+    session = VOTE_SESSIONS.get(room_id)
+    if not session:
+        await query.answer("Голосование завершено.", show_alert=True)
+        return
+    loop = asyncio.get_running_loop()
+    if session.ended or loop.time() >= session.ends_at:
+        await query.answer("Голосование завершено.", show_alert=True)
+        if not session.ended:
+            await _finalize_vote_session(session, context)
+        return
+    voter_id = query.from_user.id
+    if voter_id not in session.candidates:
+        await query.answer("Вы спектатор и не можете голосовать.", show_alert=True)
+        return
+    if target_id not in session.candidates:
+        await query.answer("Неверный игрок.", show_alert=True)
+        return
+    session.votes[voter_id] = target_id
+    await query.answer("Голос учтён")
 
 @subscription_required
 @decorators.rate_limit()
+@decorators.private_chat_only()
 @decorators.creator_only()
 @decorators.room_lock()
-async def restart_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     room_id = await db.get_user_room(user_id)
-
     if not room_id:
         await update.message.reply_text("❌ Вы не в комнате!")
-
         return
 
     room = await db.get_room(room_id)
-
     if not room:
         await update.message.reply_text("❌ Комната не найдена!")
-
+        return
+    if not room.get("game_started"):
+        await update.message.reply_text("⏳ Голосование доступно только во время игры.")
         return
 
-    await db.reset_room_game(room_id)
+    loop = asyncio.get_running_loop()
+    existing = VOTE_SESSIONS.get(room_id)
+    if existing and not existing.ended and loop.time() < existing.ends_at:
+        await update.message.reply_text("⏳ Голосование уже идёт.")
+        return
+    if existing and not existing.ended:
+        await _finalize_vote_session(existing, context)
 
     players = await db.get_room_players(room_id)
+    spectators = _get_room_spectators(room)
+    candidates = [player_id for player_id in players if player_id not in spectators]
+    if len(candidates) < 2:
+        await update.message.reply_text("❌ Нужно минимум 2 игрока для голосования (не спектаторы).")
+        return
 
-    words, _ = get_words_and_cards_by_mode(room["mode"])
+    player_labels: Dict[int, str] = {}
+    player_buttons: List[Tuple[int, str]] = []
+    for index, player_id in enumerate(candidates, start=1):
+        label = None
+        try:
+            chat = await context.bot.get_chat(player_id)
+            label = _get_user_display_for_chat(chat)
+        except Exception:
+            label = None
+        if not label:
+            label = f"Игрок {index}"
+        label = f"{index}. {label}"
+        player_labels[player_id] = label
+        player_buttons.append((player_id, label))
 
-    inline_keyboard = get_inline_keyboard('restart_game')
-    
-    status = await db.get_room(room_id)
-
-    await update.message.reply_text(
-        get_restart_room_text(status["is_public"],room_id,players,room),
-        parse_mode=ParseMode.HTML,
-        reply_markup=inline_keyboard,
+    started_at = loop.time()
+    session = VoteSession(
+        room_id=room_id,
+        creator_id=user_id,
+        players=players,
+        candidates=candidates,
+        player_labels=player_labels,
+        started_at=started_at,
+        ends_at=started_at + VOTE_DURATION_SECONDS,
     )
+    VOTE_SESSIONS[room_id] = session
 
+    keyboard = build_vote_keyboard(player_buttons, room_id)
+    prompt_text = _build_vote_prompt_text(VOTE_DURATION_SECONDS)
+    spectator_note = "\n\n👀 Вы спектатор — голосование недоступно."
+
+    message_refs: List[Tuple[int, int]] = []
     for player_id in players:
-        if player_id != user_id:
-            try:
+        try:
+            if player_id in spectators:
                 await context.bot.send_message(
-                    player_id,
-                    "🔄 Создатель перезапустил игру!\nОжидайте начала новой игры.",
+                    chat_id=player_id,
+                    text=prompt_text + spectator_note,
                 )
+                continue
+            message = await context.bot.send_message(
+                chat_id=player_id,
+                text=prompt_text,
+                reply_markup=keyboard,
+            )
+            message_refs.append((player_id, message.message_id))
+        except Exception:
+            continue
 
-            except:
-                pass
+    if not message_refs:
+        VOTE_SESSIONS.pop(room_id, None)
+        await update.message.reply_text("❌ Не удалось отправить голосование игрокам.")
+        return
 
+    session.message_refs = message_refs
+    session.end_task = asyncio.create_task(_finish_vote_task(session, context))
 
-@subscription_required
-@decorators.rate_limit()
-@decorators.private_chat_only()
-@decorators.rate_limit()
-@decorators.private_chat_only()
 async def get_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -1299,13 +1573,17 @@ async def show_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     room = await db.get_room(room_id)
 
     players = await db.get_room_players(room_id)
+    spectators = _get_room_spectators(room)
 
     players_list = ""
 
     for i, player_id in enumerate(players):
         player_data = await db.get_player_data(player_id, room_id)
 
-        role = player_data["role"] if player_data and player_data["role"] else "ожидает"
+        if player_id in spectators:
+            role = "спектатор"
+        else:
+            role = player_data["role"] if player_data and player_data["role"] else "ожидает"
 
         players_list += f"• Игрок {i + 1} ({role})\n"
 
@@ -1395,7 +1673,11 @@ async def leave_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     await db.remove_player_from_all_rooms(user_id)
-    keyboard = get_main_keyboard()
+    if user_id in ADMIN:
+        keyboard = get_main_keyboard("😈 Админ Панель")
+    else:
+        keyboard = get_main_keyboard()
+
 
     await update.message.reply_text("✅ Вы вышли из комнаты!", reply_markup=keyboard)
 
@@ -1403,7 +1685,11 @@ async def leave_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @subscription_required
 @decorators.rate_limit()
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = get_main_keyboard()
+    user_id = update.effective_user.id
+    if user_id in ADMIN:
+        keyboard = get_main_keyboard("😈 Админ Панель")
+    else:
+        keyboard = get_main_keyboard()
 
     room_id = await db.get_user_room(update.effective_user.id)
 
@@ -1458,7 +1744,10 @@ async def show_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         mode = DEFAULT_MODE
 
-        keyboard = get_main_keyboard()
+        if user_id in ADMIN:
+            keyboard = get_main_keyboard("😈 Админ Панель")
+        else:
+            keyboard = get_main_keyboard()
 
     words, cards_map = get_words_and_cards_by_mode(mode)
 
@@ -1680,11 +1969,11 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 4:
             return
         try:
-            report_user_id = int(parts[2])
+            report_id = int(parts[2])
             index = int(parts[3])
         except ValueError:
             return
-        await db.delete_user_report(report_user_id)
+        await db.delete_report(report_id)
         reports = await db.result_report()
         if not reports:
             try:
@@ -1715,7 +2004,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 4:
             return
         try:
-            report_user_id = int(parts[2])
+            report_id = int(parts[2])
             index = int(parts[3])
         except ValueError:
             return
@@ -2116,6 +2405,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await start_game(update, context)
     elif text == "🔄 Перезапустить":
         await restart_game(update, context)
+    elif text == "🗳️ Голосование":
+        await start_vote(update, context)
     elif text == "📖 Правила":
         await rules(update, context)
     elif text == "🃏 Сингл мод":
@@ -2163,6 +2454,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_id = update.effective_user.id
         room_id = await db.get_user_room(user_id)
         if room_id:
+            room = await db.get_room(room_id)
+            spectators = _get_room_spectators(room)
+            if user_id in spectators:
+                await update.message.reply_text("👀 Вы спектатор и не можете писать в чат комнаты.")
+                return
             await _broadcast_room_chat(
                 room_id=room_id,
                 sender_id=user_id,
@@ -2193,6 +2489,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "Войти: /join <ID>\n"
             "Проверить комнату: /room"
         )
+        return
+
+    room = await db.get_room(room_id)
+    spectators = _get_room_spectators(room)
+    if user_id in spectators:
+        await message.reply_text("👀 Вы спектатор и не можете отправлять сообщения в комнату.")
         return
 
     await _broadcast_room_voice(
@@ -2631,6 +2933,14 @@ async def _process_help_system_input(
 
     if text_input == "⬅️ Назад":
         context.user_data.pop("awaiting_help_system", None)
+        help_message_id = context.user_data.pop("help_system_message_id", None)
+        if help_message_id and message.chat_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=message.chat_id, message_id=help_message_id
+                )
+            except Exception:
+                pass
         await message.reply_text("❌ Заявка отменена.")
         await show_main_menu(user_id, context)
         return
@@ -2650,6 +2960,14 @@ async def _process_help_system_input(
     context.user_data["imga_input"] = image_bytes
     context.user_data["text_input"] = text_input
     context.user_data.pop("awaiting_help_system", None)
+    help_message_id = context.user_data.pop("help_system_message_id", None)
+    if help_message_id and message.chat_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=message.chat_id, message_id=help_message_id
+            )
+        except Exception:
+            pass
 
     result_image = (
         compress_to_bytes(image_bytes, image_format="WEBP")
@@ -2658,7 +2976,10 @@ async def _process_help_system_input(
     )
     await db.add_user_report(user_id, result_image, text_input)
 
-    keyboard = get_main_keyboard("😈 Админ Панель")
+    if user_id in ADMIN:
+        keyboard = get_main_keyboard("😈 Админ Панель")
+    else:
+        keyboard = get_main_keyboard()
     
     await message.reply_text(
         "✅ Спасибо! Сообщение отправлено в поддержку.",
@@ -2680,18 +3001,19 @@ async def handle_help_system_photo(
 async def help_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     context.user_data["awaiting_help_system"] = True
-    await context.bot.send_message(
-                chat_id=user_id,
-                text = (
-                    "Кнопка поддержки позволяет отправить сообщение для общения с командой 💬\n"
-                    "Все обращения обрабатываются администраторами 👩‍💻\n"
-                    "Вы также можете прикреплять фотографии 📸\n\n"
-                    "Кроме того, сюда можно отправлять ваши идеи по улучшению бота 💡\n"
-                    "Лучшие предложения будут использованы,создатель получит награду!💰✨"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=get_keyboard_report()
+    sent = await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            "Кнопка поддержки позволяет отправить сообщение для общения с командой 💬\n"
+            "Все обращения обрабатываются администраторами 👩‍💻\n"
+            "Вы также можете прикреплять фотографии 📸\n\n"
+            "Кроме того, сюда можно отправлять ваши идеи по улучшению бота 💡\n"
+            "Лучшие предложения будут использованы,создатель получит награду!💰✨"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_keyboard_report(),
     )
+    context.user_data["help_system_message_id"] = sent.message_id
 async def check_reports_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     result_report = await db.get_report_users()

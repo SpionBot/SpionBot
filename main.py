@@ -61,6 +61,7 @@ from handlers.commands import (
     successful_payment_callback,
     single_mode,
     single_mode_callback,
+    vote_callback,
 )
 from handlers.callback import (
     check_clue_callback,
@@ -221,6 +222,9 @@ async def main():
     )
     application.add_handler(
         CallbackQueryHandler(report_callback, pattern=r"^report:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(vote_callback, pattern=r"^vote:")
     )
     application.add_handler(CommandHandler("donate", donate))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))

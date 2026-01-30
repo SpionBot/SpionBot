@@ -38,6 +38,9 @@ class CreateDB:
                     word VARCHAR(100),
                     spy_id BIGINT,
                     spy_count INTEGER NOT NULL DEFAULT 1,
+                    spectators BIGINT[] DEFAULT '{}',
+                    initial_player_count INTEGER,
+                    non_spy_kicks INTEGER NOT NULL DEFAULT 0,
                     card_url TEXT,
                     game_started BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -51,6 +54,15 @@ class CreateDB:
 
             await conn.execute(
                 "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            await conn.execute(
+                "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS spectators BIGINT[] DEFAULT '{}'"
+            )
+            await conn.execute(
+                "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS initial_player_count INTEGER"
+            )
+            await conn.execute(
+                "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS non_spy_kicks INTEGER NOT NULL DEFAULT 0"
             )
 
 
@@ -101,10 +113,64 @@ class CreateDB:
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_reports (
-                    user_id BIGINT PRIMARY KEY,
-                    content TEXT  ,
-                    file BYTEA,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    content TEXT,
+                    files BYTEA,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Ensure user_reports supports multiple reports per user (migration from older schema).
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'user_reports'"
+            )
+            colset = {row["column_name"] for row in cols}
+            has_file = "file" in colset
+            has_updated_at = "updated_at" in colset
+            if "files" not in colset:
+                await conn.execute("ALTER TABLE user_reports ADD COLUMN files BYTEA")
+            if "created_at" not in colset:
+                await conn.execute(
+                    "ALTER TABLE user_reports ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                )
+            if "id" not in colset:
+                await conn.execute("ALTER TABLE user_reports ADD COLUMN id BIGSERIAL")
+            if "user_id" not in colset:
+                await conn.execute("ALTER TABLE user_reports ADD COLUMN user_id BIGINT")
+
+            if has_file:
+                await conn.execute(
+                    "UPDATE user_reports SET files = file WHERE files IS NULL AND file IS NOT NULL"
+                )
+            if has_updated_at:
+                await conn.execute(
+                    "UPDATE user_reports SET created_at = updated_at WHERE created_at IS NULL AND updated_at IS NOT NULL"
+                )
+
+            await conn.execute("UPDATE user_reports SET id = DEFAULT WHERE id IS NULL")
+            await conn.execute("ALTER TABLE user_reports ALTER COLUMN id SET NOT NULL")
+
+            pk = await conn.fetchrow(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'user_reports'::regclass AND contype = 'p'"
+            )
+            pk_cols = await conn.fetch(
+                """
+                SELECT a.attname
+                FROM pg_constraint c
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+                WHERE c.conrelid = 'user_reports'::regclass AND c.contype = 'p'
+                """
+            )
+            pk_col_names = {row["attname"] for row in pk_cols}
+            if pk and "id" not in pk_col_names:
+                await conn.execute(
+                    f'ALTER TABLE user_reports DROP CONSTRAINT "{pk["conname"]}"'
+                )
+                pk = None
+            if not pk:
+                await conn.execute("ALTER TABLE user_reports ADD PRIMARY KEY (id)")
+
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS user_reports_user_id_idx ON user_reports (user_id)"
+            )
 db_init = CreateDB()
