@@ -92,3 +92,19 @@ def test_purchase_hints_paths():
     assert asyncio.run(cmd.purchase_hints(1, 5)) is None
     result = asyncio.run(cmd.purchase_hints(1, 1, hard=1))
     assert result["hard_hints"] == 1
+
+
+def test_misc_db_methods_execute():
+    conn = FakeConn(fetchrow_results=[{"user_id": 1, "room_id": "1"}])
+    cmd = ButtonCommand(FakePool(conn))
+    asyncio.run(cmd.delete_room("1"))
+    asyncio.run(cmd.update_room_mode("1", "mode"))
+    asyncio.run(cmd.remove_player_from_room(1, "1"))
+    asyncio.run(cmd.remove_player_from_all_rooms(1))
+    player = asyncio.run(cmd.get_player_data(1, "1"))
+    assert player["user_id"] == 1
+    asyncio.run(cmd.update_player_role(1, "1", "role", "word", "url"))
+    asyncio.run(cmd.transfer_room_ownership("1", 2))
+    asyncio.run(cmd.cleanup_old_rooms())
+    asyncio.run(cmd.cleanup_image_cache())
+    assert conn.executed

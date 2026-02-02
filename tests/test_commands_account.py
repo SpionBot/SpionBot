@@ -78,6 +78,12 @@ def test_buy_hint_callbacks(monkeypatch, fake_context):
     from tests.conftest import FakeCallbackQuery, FakeMessage
 
     update = type("Update", (), {})()
+    update.callback_query = None
+    asyncio.run(commands.buy_hint_type_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("buy_type", user_id=1, message=FakeMessage())
+    asyncio.run(commands.buy_hint_type_callback(update, fake_context))
+
     update.callback_query = FakeCallbackQuery("buy_type:back", user_id=1, message=FakeMessage())
     asyncio.run(commands.buy_hint_type_callback(update, fake_context))
     assert update.callback_query.message.edits
@@ -93,6 +99,12 @@ def test_buy_hint_callbacks(monkeypatch, fake_context):
     update.callback_query = FakeCallbackQuery("buy_confirm:easy:bad", user_id=1, message=FakeMessage())
     asyncio.run(commands.buy_hint_confirm_callback(update, fake_context))
     assert update.callback_query.message.edits
+
+    update.callback_query = None
+    asyncio.run(commands.buy_hint_confirm_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("buy_confirm:easy", user_id=1, message=FakeMessage())
+    asyncio.run(commands.buy_hint_confirm_callback(update, fake_context))
 
     update.callback_query = FakeCallbackQuery("buy_confirm:unknown:1", user_id=1, message=FakeMessage())
     asyncio.run(commands.buy_hint_confirm_callback(update, fake_context))
@@ -118,6 +130,9 @@ def test_buy_hint_callbacks(monkeypatch, fake_context):
     asyncio.run(commands.buy_hint_cancel_callback(update, fake_context))
     assert update.callback_query.message.edits
 
+    update.callback_query = None
+    asyncio.run(commands.buy_hint_cancel_callback(update, fake_context))
+
 
 def test_cabinet_actions(monkeypatch, fake_context):
     from tests.conftest import FakeCallbackQuery, FakeMessage
@@ -130,6 +145,9 @@ def test_cabinet_actions(monkeypatch, fake_context):
     monkeypatch.setattr(commands, "show_main_menu", fake_show_menu)
 
     update = type("Update", (), {})()
+    update.callback_query = None
+    asyncio.run(commands.cabinet_action_callback(update, fake_context))
+
     update.callback_query = FakeCallbackQuery("cabinet:menu", user_id=1, message=FakeMessage())
     asyncio.run(commands.cabinet_action_callback(update, fake_context))
     assert called["menu"] == 1
@@ -151,6 +169,12 @@ def test_donate_amount_callback(monkeypatch, fake_context):
     from tests.conftest import FakeCallbackQuery, FakeMessage
 
     update = type("Update", (), {})()
+    update.callback_query = None
+    asyncio.run(commands.donate_amount_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("donate_amount", user_id=1, message=FakeMessage())
+    asyncio.run(commands.donate_amount_callback(update, fake_context))
+
     update.callback_query = FakeCallbackQuery("donate_amount:bad", user_id=1, message=FakeMessage())
     asyncio.run(commands.donate_amount_callback(update, fake_context))
     assert update.callback_query.message.edits

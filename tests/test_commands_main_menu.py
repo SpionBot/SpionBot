@@ -30,6 +30,22 @@ def test_start_subscription_gate(monkeypatch, fake_context, make_update):
     assert update.message.replies
 
 
+def test_start_subscribed_calls_menu(monkeypatch, fake_context, make_update):
+    async def always_true(bot, user_id):
+        return True
+
+    called = {"value": False}
+
+    async def fake_menu(user_id, context):
+        called["value"] = True
+
+    monkeypatch.setattr(commands, "is_subscribed", always_true)
+    monkeypatch.setattr(commands, "show_main_menu", fake_menu)
+    update = make_update(user_id=1, text="/start")
+    asyncio.run(commands.start(update, fake_context))
+    assert called["value"] is True
+
+
 def test_check_subscription_callback_paths(monkeypatch, fake_context):
     async def always_true(bot, user_id):
         return True
@@ -57,6 +73,24 @@ def test_check_subscription_callback_paths(monkeypatch, fake_context):
     monkeypatch.setattr(commands, "is_subscribed", always_false)
     asyncio.run(commands.check_subscription_callback(update, fake_context))
     assert update.callback_query.message.edits
+
+    def raise_edit(*args, **kwargs):
+        from telegram.error import BadRequest
+
+        raise BadRequest("fail")
+
+    update = type("Update", (), {})()
+    message = FakeMessage()
+    message.edit_text = raise_edit
+    update.callback_query = FakeCallbackQuery("check_subscription", user_id=1, message=message)
+    monkeypatch.setattr(commands, "is_subscribed", always_false)
+    asyncio.run(commands.check_subscription_callback(update, fake_context))
+
+
+def test_single_mode_reply(monkeypatch, fake_context, make_update):
+    update = make_update(user_id=1, text="/single")
+    asyncio.run(commands.single_mode(update, fake_context))
+    assert update.message.replies
 
 
 def test_error_handler_swallows_exceptions(make_update, fake_context):

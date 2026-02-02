@@ -44,6 +44,28 @@ def test_get_single_mode_photo_variants(monkeypatch):
     assert commands._get_single_mode_photo(session) == commands.SINGLE_MODE_PLACEHOLDER_URL
 
 
+def test_build_single_mode_keyboard_spy_label():
+    session = SingleModeSession(
+        chat_id=1,
+        message_id=1,
+        word="WORD",
+        card_url="",
+        player_count=2,
+        spy_index=0,
+        current_index=0,
+        mode="mode",
+        revealed=True,
+    )
+    keyboard = commands._build_single_mode_keyboard(session)
+    center_text = keyboard.inline_keyboard[0][1].text
+    assert "шпион" in center_text.lower()
+
+
+def test_create_single_mode_session_empty(monkeypatch):
+    monkeypatch.setattr(commands, "get_words_and_cards_by_mode", lambda mode: ([], {}))
+    assert commands._create_single_mode_session(2, "mode") is None
+
+
 def test_send_single_mode_card_success_and_fallback(monkeypatch, fake_context):
     session = SingleModeSession(
         chat_id=1,
@@ -93,6 +115,19 @@ def test_update_single_mode_message_fallback(monkeypatch):
     asyncio.run(commands._update_single_mode_message(query, session))
     assert message.edits
 
+    query = FakeCallbackQuery("single:noop", user_id=1, message=FakeMessage())
+    query.message = None
+    asyncio.run(commands._update_single_mode_message(query, session))
+
+    async def raise_caption(*args, **kwargs):
+        raise BadRequest("fail")
+
+    message = FakeMessage()
+    message.edit_caption = raise_caption
+    query = FakeCallbackQuery("single:noop", user_id=1, message=message)
+    monkeypatch.setattr(query, "edit_message_media", raise_badrequest)
+    asyncio.run(commands._update_single_mode_message(query, session))
+
 
 def test_single_mode_callback_select_and_cancel(monkeypatch, fake_context):
     commands.SINGLE_MODE_SESSIONS.clear()
@@ -127,9 +162,21 @@ def test_single_mode_callback_select_and_cancel(monkeypatch, fake_context):
     asyncio.run(commands.single_mode_callback(update, fake_context))
     assert commands.SINGLE_MODE_SESSIONS[1].message_id == 42
 
-    update.callback_query = FakeCallbackQuery("single:cancel", user_id=1, message=FakeMessage())
+    async def raise_delete():
+        raise BadRequest("fail")
+
+    msg = FakeMessage()
+    msg.delete = raise_delete
+    update.callback_query = FakeCallbackQuery("single:select:2", user_id=1, message=msg)
     asyncio.run(commands.single_mode_callback(update, fake_context))
-    assert update.callback_query.message.edits
+
+    async def raise_edit(*args, **kwargs):
+        raise BadRequest("fail")
+
+    msg = FakeMessage()
+    msg.edit_text = raise_edit
+    update.callback_query = FakeCallbackQuery("single:cancel", user_id=1, message=msg)
+    asyncio.run(commands.single_mode_callback(update, fake_context))
 
 
 def test_single_mode_callback_actions(monkeypatch, fake_context):
@@ -190,3 +237,67 @@ def test_single_mode_callback_actions(monkeypatch, fake_context):
 
     assert called["updates"] >= 3
     assert called["show_menu"] == 1
+
+
+def test_single_mode_callback_invalid_and_missing(monkeypatch, fake_context):
+    commands.SINGLE_MODE_SESSIONS.clear()
+
+    update = type("Update", (), {})()
+    update.callback_query = None
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+
+    from tests.conftest import FakeCallbackQuery, FakeMessage
+
+    update.callback_query = FakeCallbackQuery("single", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("single:select", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("single:select:abc", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+
+    update.callback_query = FakeCallbackQuery("single:select:99", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+    assert update.callback_query.answered
+
+    monkeypatch.setattr(commands, "_create_single_mode_session", lambda *_: None)
+    update.callback_query = FakeCallbackQuery("single:select:2", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+    assert update.callback_query.answered
+
+    update.callback_query = FakeCallbackQuery("single:prev", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+    assert update.callback_query.answered
+
+    commands.SINGLE_MODE_SESSIONS[1] = SingleModeSession(
+        chat_id=1,
+        message_id=1,
+        word="WORD",
+        card_url="",
+        player_count=0,
+        spy_index=0,
+        current_index=0,
+        mode="mode",
+    )
+    update.callback_query = FakeCallbackQuery("single:prev", user_id=1, message=FakeMessage())
+    asyncio.run(commands.single_mode_callback(update, fake_context))
+    assert update.callback_query.answered
+
+    async def raise_delete():
+        raise BadRequest("fail")
+
+    message = FakeMessage()
+    message.delete = raise_delete
+    commands.SINGLE_MODE_SESSIONS[1] = SingleModeSession(
+        chat_id=1,
+        message_id=1,
+        word="WORD",
+        card_url="",
+        player_count=2,
+        spy_index=0,
+        current_index=0,
+        mode="mode",
+    )
+    update.callback_query = FakeCallbackQuery("single:exit", user_id=1, message=message)
+    asyncio.run(commands.single_mode_callback(update, fake_context))

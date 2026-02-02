@@ -49,3 +49,45 @@ def test_generate_clue_updates_store(monkeypatch):
         asyncio.run(background.generate_clue())
 
     assert background.clue_obj.clue_dota2["Hero"]["easy"] == ["a"]
+
+
+def test_periodic_cleanup_logs_error(monkeypatch, fake_db):
+    background = _reload_background()
+
+    async def fail_cleanup():
+        raise RuntimeError("fail")
+
+    monkeypatch.setattr(background.db, "cleanup_old_rooms", fail_cleanup)
+    monkeypatch.setattr(background.db, "cleanup_image_cache", fail_cleanup)
+
+    async def fake_sleep(_):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(background.periodic_cleanup())
+
+
+def test_generate_clue_logs_error(monkeypatch):
+    const.PROMPTS = {"dota2": "prompt {Heroname}"}
+    background = _reload_background()
+    background.game_array = {"dota2": ["Hero"]}
+
+    def raise_ask(_prompt):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(background, "ask_llm", raise_ask)
+
+    sleep_calls = {"count": 0}
+
+    async def fake_sleep(_):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            raise asyncio.CancelledError()
+        return None
+
+    monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(background.generate_clue())
