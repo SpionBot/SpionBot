@@ -49,6 +49,15 @@ class CreateDB:
                 )
             """)
             await conn.execute(
+                "CREATE INDEX IF NOT EXISTS rooms_creator_created_idx ON rooms (creator_id, created_at DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS rooms_public_open_idx ON rooms (is_public, game_started, expires_at, created_at DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS rooms_expires_at_idx ON rooms (expires_at)"
+            )
+            await conn.execute(
                 "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS spy_count INTEGER NOT NULL DEFAULT 1"
             )
 
@@ -78,6 +87,12 @@ class CreateDB:
                     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
                 )
             """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS players_room_id_idx ON players (room_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS players_room_joined_idx ON players (room_id, joined_at)"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_accounts (
                     user_id BIGINT PRIMARY KEY,
@@ -103,6 +118,9 @@ class CreateDB:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS referrals_inviter_id_idx ON referrals (inviter_id)"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS image_cache (
                     url TEXT PRIMARY KEY,
@@ -111,6 +129,9 @@ class CreateDB:
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS image_cache_cached_at_idx ON image_cache (cached_at)"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_reports (
                     id BIGSERIAL PRIMARY KEY,
@@ -172,5 +193,8 @@ class CreateDB:
 
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS user_reports_user_id_idx ON user_reports (user_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS user_reports_created_id_idx ON user_reports (created_at DESC, id DESC)"
             )
 db_init = CreateDB()
