@@ -1,8 +1,71 @@
+import asyncio
 import logging
 
 import asyncpg
 
 logger = logging.getLogger(__name__)
+
+
+TRANSIENT_DB_ERRORS = (
+    asyncpg.ConnectionDoesNotExistError,
+    asyncpg.InterfaceError,
+    asyncpg.PostgresConnectionError,
+    ConnectionError,
+    OSError,
+    asyncio.TimeoutError,
+)
+
+
+class _ResilientAcquireContext:
+    def __init__(self, owner: "CreateDB", timeout=None):
+        self._owner = owner
+        self._timeout = timeout
+        self._acquire_ctx = None
+        self._conn = None
+
+    async def __aenter__(self):
+        last_error = None
+        for attempt in range(2):
+            raw_pool = self._owner._raw_pool
+            if raw_pool is None:
+                await self._owner.reconnect_pool()
+                raw_pool = self._owner._raw_pool
+            try:
+                self._acquire_ctx = raw_pool.acquire(timeout=self._timeout)
+                self._conn = await self._acquire_ctx.__aenter__()
+                return self._conn
+            except TRANSIENT_DB_ERRORS as exc:
+                last_error = exc
+                logger.warning(
+                    "PostgreSQL acquire failed on attempt %s/2: %s. Recreating pool.",
+                    attempt + 1,
+                    exc,
+                )
+                await self._owner.reconnect_pool()
+        raise last_error
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._acquire_ctx is None:
+            return False
+        return await self._acquire_ctx.__aexit__(exc_type, exc, tb)
+
+
+class ResilientPool:
+    def __init__(self, owner: "CreateDB"):
+        self._owner = owner
+
+    def acquire(self, *, timeout=None):
+        return _ResilientAcquireContext(self._owner, timeout=timeout)
+
+    async def close(self):
+        if self._owner._raw_pool is not None:
+            await self._owner._raw_pool.close()
+
+    def __getattr__(self, item):
+        raw_pool = self._owner._raw_pool
+        if raw_pool is None:
+            raise AttributeError(item)
+        return getattr(raw_pool, item)
 
 
 class CreateDB:
@@ -12,20 +75,49 @@ class CreateDB:
 
     def __init__(self):
         self.pool = None
+        self._raw_pool = None
+        self._pool_lock = asyncio.Lock()
+        self._dsn = None
+        self._min_size = 5
+        self._max_size = 20
 
     async def connect(self, dsn: str, min_size: int = 5, max_size: int = 20):
-        self.pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=min_size,
-            max_size=max_size,
+        self._dsn = dsn
+        self._min_size = min_size
+        self._max_size = max_size
+        await self._open_pool()
+        if self.pool is None:
+            self.pool = ResilientPool(self)
+        logger.info("Connected to PostgreSQL")
+        await self.init_db()
+
+    async def _open_pool(self):
+        self._raw_pool = await asyncpg.create_pool(
+            dsn=self._dsn,
+            min_size=self._min_size,
+            max_size=self._max_size,
             command_timeout=60,
+            max_inactive_connection_lifetime=300,
             server_settings={
                 "application_name": "spy_game_bot",
                 "idle_in_transaction_session_timeout": "60000",
             },
         )
-        logger.info("Connected to PostgreSQL")
-        await self.init_db()
+        return self._raw_pool
+
+    async def reconnect_pool(self):
+        if not self._dsn:
+            raise RuntimeError("Database DSN is not configured")
+        async with self._pool_lock:
+            try:
+                current_pool = self._raw_pool
+                if current_pool is not None and not getattr(current_pool, "_closed", False):
+                    await current_pool.close()
+            except Exception as exc:
+                logger.warning("Failed to close broken PostgreSQL pool cleanly: %s", exc)
+            self._raw_pool = None
+            await self._open_pool()
+            logger.info("PostgreSQL pool recreated")
 
     async def init_db(self):
         async with self.pool.acquire() as conn:
