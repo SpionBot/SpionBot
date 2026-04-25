@@ -3,14 +3,16 @@ from typing import List, Optional, Literal,Tuple
 
 import asyncpg
 
-from database.init import CreateDB, db_init
+from database.init import CreateDB
 
 logger = logging.getLogger(__name__)
 
 
 class ButtonCommand(CreateDB):
-    def __init__(self, pool):
-        self.pool = pool
+    def __init__(self, pool=None):
+        super().__init__()
+        if pool is not None:
+            self.pool = pool
 
     async def create_room(
         self,
@@ -675,5 +677,4 @@ class ButtonCommand(CreateDB):
             return rows["games_played"],rows["spy_games_played"]
 
 
-db = ButtonCommand(db_init.pool)
-
+db = ButtonCommand()
